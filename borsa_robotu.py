@@ -7,14 +7,6 @@ try:
 except Exception:
     pass
 
-def guvenli_giris_bekle(mesaj=""):
-    if not os.getenv("GITHUB_ACTIONS") and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
-        try:
-            return input(mesaj)
-        except Exception:
-            pass
-    return ""
-
 import time
 import json
 import traceback
@@ -38,7 +30,7 @@ except ImportError as e:
     print("Aşağıdaki komutu çalıştırıp gerekli kütüphaneleri kur:\n")
     print("  pip install pandas yfinance requests prettytable colorama python-dotenv tzdata\n")
     print("=" * 60)
-    guvenli_giris_bekle("Kapatmak için Enter tuşuna basın...")
+    input("Kapatmak için Enter tuşuna basın...")
     sys.exit(1)
 
 # --- SAAT DİLİMİ KONTROLÜ ---
@@ -54,7 +46,7 @@ except Exception as e:
     print("  pip install tzdata\n")
     print("Kurulumdan sonra programı tekrar başlat.")
     print("=" * 60)
-    guvenli_giris_bekle("Kapatmak için Enter tuşuna basın...")
+    input("Kapatmak için Enter tuşuna basın...")
     sys.exit(1)
 
 # --- ORTAM DEĞİŞKENLERİ (.env dosyasından okunur) ---
@@ -1718,25 +1710,22 @@ try:
     print("İlk tarama yapılıyor...")
     piyasa_tara()
 
-    if not os.getenv("GITHUB_ACTIONS"):
-        while True:
-            try:
-                print(Fore.LIGHTBLUE_EX + f"\n[{datetime.now(ISTANBUL_TZ).strftime('%H:%M:%S')}] Sonraki tarama: {TARAMA_ARALIGI} dakika sonra..." + Style.RESET_ALL)
-                print(Fore.YELLOW + "Kapatmak için Ctrl+C basın" + Style.RESET_ALL)
-                time.sleep(TARAMA_ARALIGI * 60)
-                # Yapılandırmayı ve sembolleri her döngüde yeniden yükle (config.json güncellenmiş olabilir)
-                PIYASALAR, VERBOSE, TARAMA_ARALIGI = config_yukle()
-                piyasa_tara()
-            except KeyboardInterrupt:
-                print("\nKullanıcı tarafından durduruldu.")
-                break
-            except Exception as e:
-                hata_kaydet(traceback.format_exc())
-                print(Fore.RED + f"\n[!] Döngü hatası: {e}" + Style.RESET_ALL)
-                print(Fore.YELLOW + "15 saniye sonra tekrar deneniyor..." + Style.RESET_ALL)
-                time.sleep(15)
-    else:
-        print(Fore.GREEN + "\n[+] GitHub Actions ortamı algılandı. Tarama başarıyla tamamlandı ve sonlandırılıyor." + Style.RESET_ALL)
+    while True:
+        try:
+            print(Fore.LIGHTBLUE_EX + f"\n[{datetime.now(ISTANBUL_TZ).strftime('%H:%M:%S')}] Sonraki tarama: {TARAMA_ARALIGI} dakika sonra..." + Style.RESET_ALL)
+            print(Fore.YELLOW + "Kapatmak için Ctrl+C basın" + Style.RESET_ALL)
+            time.sleep(TARAMA_ARALIGI * 60)
+            # Yapılandırmayı ve sembolleri her döngüde yeniden yükle (config.json güncellenmiş olabilir)
+            PIYASALAR, VERBOSE, TARAMA_ARALIGI = config_yukle()
+            piyasa_tara()
+        except KeyboardInterrupt:
+            print("\nKullanıcı tarafından durduruldu.")
+            break
+        except Exception as e:
+            hata_kaydet(traceback.format_exc())
+            print(Fore.RED + f"\n[!] Döngü hatası: {e}" + Style.RESET_ALL)
+            print(Fore.YELLOW + "15 saniye sonra tekrar deneniyor..." + Style.RESET_ALL)
+            time.sleep(15)
 
 except KeyboardInterrupt:
     print("\nProgram kapatıldı.")
@@ -1747,4 +1736,4 @@ except Exception as e:
 finally:
     print("\n" + "=" * 50)
     print("Kapatmak için Enter tuşuna basın...")
-    guvenli_giris_bekle()
+    input()
