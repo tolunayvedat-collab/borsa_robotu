@@ -7,14 +7,6 @@ try:
 except Exception:
     pass
 
-def guvenli_giris_bekle(mesaj=""):
-    if not os.getenv("GITHUB_ACTIONS") and hasattr(sys.stdin, "isatty") and sys.stdin.isatty():
-        try:
-            return input(mesaj)
-        except Exception:
-            pass
-    return ""
-
 import time
 import json
 import traceback
@@ -38,7 +30,7 @@ except ImportError as e:
     print("Aşağıdaki komutu çalıştırıp gerekli kütüphaneleri kur:\n")
     print("  pip install pandas yfinance requests prettytable colorama python-dotenv tzdata\n")
     print("=" * 60)
-    guvenli_giris_bekle("Kapatmak için Enter tuşuna basın...")
+    input("Kapatmak için Enter tuşuna basın...")
     sys.exit(1)
 
 # --- SAAT DİLİMİ KONTROLÜ ---
@@ -54,7 +46,7 @@ except Exception as e:
     print("  pip install tzdata\n")
     print("Kurulumdan sonra programı tekrar başlat.")
     print("=" * 60)
-    guvenli_giris_bekle("Kapatmak için Enter tuşuna basın...")
+    input("Kapatmak için Enter tuşuna basın...")
     sys.exit(1)
 
 # --- ORTAM DEĞİŞKENLERİ (.env dosyasından okunur) ---
@@ -377,387 +369,8 @@ def tv_linki_olustur(symbol, piyasa_id):
         return f"https://tr.tradingview.com/symbols/BINANCE-{base_crypto}USDT/"
     return f"https://tr.tradingview.com/symbols/{symbol}/"
 
-# --- STOCHASTIC RSI ---
-def stoch_rsi_hesapla(series, period=14, stoch_period=14, smooth_k=3, smooth_d=3):
-    """Stochastic RSI — RSI'dan daha hassas aşırı alım/satım tespiti"""
-    try:
-        rsi = rsi_hesapla(series, period)
-        rsi_min = rsi.rolling(window=stoch_period).min()
-        rsi_max = rsi.rolling(window=stoch_period).max()
-        diff = (rsi_max - rsi_min).replace(0, pd.NA)
-        stoch = 100 * (rsi - rsi_min) / diff
-        k = stoch.rolling(window=smooth_k).mean().fillna(50)
-        d = k.rolling(window=smooth_d).mean().fillna(50)
-        return k, d
-    except Exception:
-        idx = series.index
-        return pd.Series(50, index=idx), pd.Series(50, index=idx)
-
-# --- YENİ: EMA CROSSOVER (EMA9 EMA21 kısa vadeli) ---
-def ema_crossover_hesapla(df):
-    """EMA9 son 5 günde EMA21'i yukarı kestiyse True — en güçlü kısa vadeli sinyal"""
-    try:
-        if len(df) < 25:
-            return False, False
-        ema9  = df['Close'].ewm(span=9,  adjust=False).mean()
-        ema21 = df['Close'].ewm(span=21, adjust=False).mean()
-        # Son 5 gün içinde EMA9, EMA21'i yukarı kesti mi?
-        crossover_yukari = False
-        crossover_asagi  = False
-        for i in range(-5, 0):
-            if ema9.iloc[i-1] <= ema21.iloc[i-1] and ema9.iloc[i] > ema21.iloc[i]:
-                crossover_yukari = True
-            if ema9.iloc[i-1] >= ema21.iloc[i-1] and ema9.iloc[i] < ema21.iloc[i]:
-                crossover_asagi = True
-        return crossover_yukari, crossover_asagi
-    except Exception:
-        return False, False
-
-# --- YENİ: HACİM GÜÇ ORANI ---
-def hacim_guc_orani_hesapla(df, pencere=10):
-    """Son N günde yükselen günlerin hacmini düşen günlerin hacmiyle karşılaştır.
-       Oran > 1.3 = boğa baskısı (alım sinyali güçlü)"""
-    try:
-        if len(df) < pencere + 1:
-            return 1.0
-        son = df.iloc[-pencere:]
-        yukari_gunler = son[son['Close'] > son['Close'].shift(1)]
-        asagi_gunler  = son[son['Close'] < son['Close'].shift(1)]
-        yukari_hacim  = yukari_gunler['Volume'].sum()
-        asagi_hacim   = asagi_gunler['Volume'].sum()
-        if asagi_hacim == 0:
-            return 2.0
-        return round(yukari_hacim / asagi_hacim, 2)
-    except Exception:
-        return 1.0
-
-# --- YENİ: RSI UYUMSUZLUĞU (BULLISH DIVERGENCE) ---
-def rsi_uyumsuzlugu_hesapla(df, pencere=20):
-    """Fiyat yeni dip yaparken RSI daha yüksek dip yapıyor = gizli boğa sinyali"""
-    try:
-        if len(df) < pencere * 2:
-            return False
-        rsi = rsi_hesapla(df['Close'], 14)
-        # Son pencere ve bir önceki penceredeki en düşükleri karşılaştır
-        son_fiyat_min   = df['Close'].iloc[-pencere:].min()
-        onceki_fiyat_min = df['Close'].iloc[-pencere*2:-pencere].min()
-        son_rsi_min     = rsi.iloc[-pencere:].min()
-        onceki_rsi_min  = rsi.iloc[-pencere*2:-pencere].min()
-        # Fiyat daha düşük dip, RSI daha yüksek dip → bullish divergence
-        bullish_div = (son_fiyat_min < onceki_fiyat_min * 0.99) and (son_rsi_min > onceki_rsi_min + 2)
-        return bool(bullish_div)
-    except Exception:
-        return False
-
-# --- YENİ: GEÇ ALIM RİSKİ FİLTRESİ ---
-def gec_alim_riski_hesapla(df):
-    """52h zirvesine çok yakın VEYA son 10 günde %20+ yükseliş = geç alım riski"""
-    try:
-        son_kapanis = df['Close'].iloc[-1]
-        pencere = min(252, len(df))
-        yuksek_52h = df['High'].iloc[-pencere:].max()
-        zirve_yakin = (son_kapanis >= yuksek_52h * 0.97)  # Zirveye %3 yakın
-        son10_kapanis = df['Close'].iloc[-11] if len(df) >= 11 else df['Close'].iloc[0]
-        hizli_yukselis = ((son_kapanis - son10_kapanis) / son10_kapanis * 100) >= 20
-        return bool(zirve_yakin or hizli_yukselis), bool(zirve_yakin), bool(hizli_yukselis)
-    except Exception:
-        return False, False, False
-
-# --- YENİ: VOLATİLİTE KALİTESİ ---
-def volatilite_kalitesi_hesapla(df, atr_val):
-    """ATR/Fiyat oranı %1-5 arası ideal: çok düşük = sıkışık, çok yüksek = gürültülü"""
-    try:
-        son_kapanis = df['Close'].iloc[-1]
-        if son_kapanis <= 0:
-            return False
-        oran = (atr_val / son_kapanis) * 100
-        return bool(1.0 <= oran <= 5.0)
-    except Exception:
-        return False
-
-# --- YENİ: GÜNLÜK vs HAFTALIK SİNYAL SINIFLANDIRMASI ---
-def sinyal_turu_belirle(item_data):
-    """Hesaplanan indikatörlere göre sinyalin günlük mi haftalık mı olduğunu belirle."""
-    gunluk_puan  = 0
-    haftalik_puan = 0
-
-    # Günlük sinyal için güçlü göstergeler
-    if item_data.get('ema_crossover_yukari'):  gunluk_puan  += 3
-    if item_data.get('hacim_yuksek'):          gunluk_puan  += 2
-    if item_data.get('patlama_adayi'):         gunluk_puan  += 2
-    if item_data.get('mum_bullish'):           gunluk_puan  += 2
-    if item_data.get('stoch_k', 50) < 40:     gunluk_puan  += 1
-
-    # Haftalık sinyal için güçlü göstergeler
-    if item_data.get('trend_yukselis'):        haftalik_puan += 3
-    if item_data.get('haftalik_yukselis'):     haftalik_puan += 3
-    if item_data.get('birikim_raw'):           haftalik_puan += 2
-    if item_data.get('sikisma'):               haftalik_puan += 2
-    if item_data.get('rs_guclu'):              haftalik_puan += 1
-
-    if gunluk_puan >= 4 and gunluk_puan > haftalik_puan:
-        return 'gunluk'
-    elif haftalik_puan >= 4:
-        return 'haftalik'
-    else:
-        return 'genel'
-
-# =========================================================
-# ERTESİ GÜN ANALİZ SİSTEMİ
-# =========================================================
-
-def kapanis_gucu_hesapla(df):
-    """Kapanış gücü: fiyat günün neresinde kapandı? (0-100%)
-    100 = tam zirvede kapandı (boğa), 0 = tam dipte kapandı (ayı)"""
-    try:
-        gun_yuksek = df['High'].iloc[-1]
-        gun_dusuk  = df['Low'].iloc[-1]
-        kapanis    = df['Close'].iloc[-1]
-        aralik     = gun_yuksek - gun_dusuk
-        if aralik <= 0:
-            return 50.0
-        return round(((kapanis - gun_dusuk) / aralik) * 100, 1)
-    except Exception:
-        return 50.0
-
-def gun_ici_oruntu_tespit(df):
-    """Gün içi kalıp tespiti: Inside Bar, Outside Bar, Güçlü/Zayıf Kapanış.
-    Döndürür: (açıklama_str, puan) — puan ertesi gün skoru için eklenir."""
-    try:
-        if len(df) < 2:
-            return "Belirsiz", 0
-        bH = df['High'].iloc[-1];  bL = df['Low'].iloc[-1]
-        bO = df['Open'].iloc[-1]; bC = df['Close'].iloc[-1]
-        dH = df['High'].iloc[-2]; dL = df['Low'].iloc[-2]
-        aralik = bH - bL
-        kap_guc = ((bC - bL) / aralik * 100) if aralik > 0 else 50
-        # Inside Bar
-        if bH <= dH and bL >= dL:
-            return "🔲 Inside Bar", 5
-        # Outside Bar
-        if bH > dH and bL < dL:
-            return ("📦 Ext.Boğa", 8) if bC > (bH+bL)/2 else ("📦 Ext.Ayı", -8)
-        # Güçlü kapanış
-        if kap_guc >= 75 and bC > bO:
-            return "💪 Güçlü Kap.", 12
-        # Zayıf kapanış
-        if kap_guc <= 25:
-            return "😞 Zayıf Kap.", -12
-        # Orta pozitif
-        if kap_guc >= 55:
-            return "📈 Poz. Kap.", 5
-        return "➖ Normal Kap.", 0
-    except Exception:
-        return "Belirsiz", 0
-
-def ardisik_yukselen_dipler(df, gun=3):
-    """Son N günde her günün dibi bir öncekinden yüksek mi? (Güçlü yükseliş trendi)"""
-    try:
-        if len(df) < gun + 1:
-            return False
-        for i in range(-gun, 0):
-            if df['Low'].iloc[i] <= df['Low'].iloc[i-1]:
-                return False
-        return True
-    except Exception:
-        return False
-
-def ertesi_gun_skoru_hesapla(df, rsi_val, rvol, trend_yukselis, haftalik_yukselis,
-                              mum_bullish, ema_crossover_yukari, gec_alim_riski,
-                              piyasa_pozitif, roc10, adx_val, stoch_k_val):
-    """Ertesi gün performans tahmini skoru (0-100).
-    Geçmiş istatistiksel kalıplara dayalı olasılık skoru — kesin tahmin değildir."""
-    try:
-        puan = 0
-
-        # 1. Kapanış Gücü — en kritik faktör (maks 25)
-        kg = kapanis_gucu_hesapla(df)
-        if   kg >= 80: puan += 25
-        elif kg >= 65: puan += 18
-        elif kg >= 50: puan += 10
-        elif kg >= 35: puan +=  3
-        else:          puan -= 12
-
-        # 2. Hacim teyidi (maks 20)
-        if   rvol >= 2.0: puan += 20
-        elif rvol >= 1.5: puan += 14
-        elif rvol >= 1.0: puan +=  8
-        else:             puan +=  2
-
-        # 3. Trend uyumu (maks 20)
-        if trend_yukselis is True and haftalik_yukselis is True: puan += 20
-        elif trend_yukselis is True:                             puan += 12
-        elif haftalik_yukselis is True:                          puan +=  8
-
-        # 4. Gün içi kalıp (maks 12)
-        _, oruntu_puani = gun_ici_oruntu_tespit(df)
-        puan += oruntu_puani
-
-        # 5. Momentum ROC10 (maks 10)
-        if   roc10 > 5: puan += 10
-        elif roc10 > 2: puan +=  7
-        elif roc10 > 0: puan +=  4
-        else:           puan -=  5
-
-        # 6. RSI ideal bölge (maks 10)
-        if   40 <= rsi_val <= 60: puan += 10  # En iyi: hareket odası var
-        elif 35 <= rsi_val <= 65: puan +=  5
-        elif rsi_val >= 75:       puan -= 10  # Aşırı alım → ertesi gün düşme riski
-        elif rsi_val <= 25:       puan -=  5
-
-        # 7. Mum formasyonu (maks 10)
-        if mum_bullish:            puan += 10
-
-        # 8. EMA Crossover (maks 8)
-        if ema_crossover_yukari:   puan +=  8
-
-        # 9. ADX trend gücü (maks 7)
-        if   adx_val >= 30: puan += 7
-        elif adx_val >= 25: puan += 4
-
-        # 10. Ardışık yükselen dipler (maks 8)
-        if ardisik_yukselen_dipler(df, 3): puan += 8
-
-        # 11. StochRSI pozisyon — en iyi alan: aşağıdan yukarı (maks 5)
-        if 20 <= stoch_k_val <= 50: puan += 5
-
-        # 12. Piyasa genel durumu (maks 5)
-        if piyasa_pozitif: puan += 5
-
-        # CEZA: Geç alım riski — zirvede, geri çekilme olası
-        if gec_alim_riski: puan -= 20
-
-        return max(0, min(100, puan))
-    except Exception:
-        return 50
-
-# --- YENİ: MUM FORMASYONU TESPİTİ ---
-def mum_formasyonu_tara(df):
-    """Son 3 mumda boğa formasyonu tespiti"""
-    try:
-        if len(df) < 3:
-            return "Yok", False
-        o = df['Open']
-        h = df['High']
-        l = df['Low']
-        c = df['Close']
-        o1, h1, l1, c1 = o.iloc[-3], h.iloc[-3], l.iloc[-3], c.iloc[-3]
-        o2, h2, l2, c2 = o.iloc[-2], h.iloc[-2], l.iloc[-2], c.iloc[-2]
-        o3, h3, l3, c3 = o.iloc[-1], h.iloc[-1], l.iloc[-1], c.iloc[-1]
-        body3 = abs(c3 - o3)
-        range3 = h3 - l3 if h3 != l3 else 0.0001
-        alt_golge3 = min(o3, c3) - l3
-        ust_golge3 = h3 - max(o3, c3)
-        # Çekiç
-        if alt_golge3 >= 2 * body3 and ust_golge3 <= body3 * 0.5 and c3 > o3:
-            return "🔨 Çekiç", True
-        # Boğa Yutan
-        if c2 < o2 and c3 > o3 and c3 >= o2 and o3 <= c2:
-            return "🟢 Boğa Yutan", True
-        # Sabah Yıldızı
-        if (c1 < o1 and abs(c2 - o2) < (h2 - l2) * 0.35 and
-                c3 > o3 and c3 > (o1 + c1) / 2):
-            return "⭐ Sabah Yıldızı", True
-        # Pin Bar (uzun alt gölge)
-        if alt_golge3 >= range3 * 0.6 and c3 > o3:
-            return "📌 Pin Bar", True
-        # Doji (kararsızlık — nötr ama dikkate değer)
-        if body3 <= range3 * 0.1:
-            return "✚ Doji", False
-        return "Yok", False
-    except Exception:
-        return "Yok", False
-
-# --- YENİ: DESTEK / DİRENÇ SEVİYELERİ ---
-def destek_direnc_hesapla(df):
-    """52 haftalık H/L + Fibonacci + Pivot destek/direnç hesapla"""
-    try:
-        son_kapanis = df['Close'].iloc[-1]
-        pencere = min(252, len(df))
-        yuksek_52h = df['High'].iloc[-pencere:].max()
-        dusuk_52h  = df['Low'].iloc[-pencere:].min()
-        fark = yuksek_52h - dusuk_52h
-        fib_236 = yuksek_52h - fark * 0.236
-        fib_382 = yuksek_52h - fark * 0.382
-        fib_500 = yuksek_52h - fark * 0.500
-        fib_618 = yuksek_52h - fark * 0.618
-        # Haftalık pivot
-        pivot_p = (df['High'].iloc[-6:-1].max() + df['Low'].iloc[-6:-1].min() + df['Close'].iloc[-2]) / 3
-        pivot_r1 = 2 * pivot_p - df['Low'].iloc[-6:-1].min()
-        pivot_s1 = 2 * pivot_p - df['High'].iloc[-6:-1].max()
-        seviyeler = sorted([dusuk_52h, fib_618, fib_500, fib_382, fib_236,
-                            pivot_s1, pivot_p, pivot_r1, yuksek_52h])
-        seviyeler_yukarda = [s for s in seviyeler if s > son_kapanis * 1.001]
-        seviyeler_asagida = [s for s in seviyeler if s < son_kapanis * 0.999]
-        yakin_direnc = min(seviyeler_yukarda) if seviyeler_yukarda else yuksek_52h
-        yakin_destek = max(seviyeler_asagida) if seviyeler_asagida else dusuk_52h
-        destek_mesafe = round((son_kapanis - yakin_destek) / son_kapanis * 100, 1)
-        direnc_mesafe = round((yakin_direnc - son_kapanis) / son_kapanis * 100, 1)
-        return {
-            "yuksek_52h":      round(yuksek_52h, 2),
-            "dusuk_52h":       round(dusuk_52h, 2),
-            "yakin_destek":    round(yakin_destek, 2),
-            "yakin_direnc":    round(yakin_direnc, 2),
-            "destek_mesafe":   destek_mesafe,
-            "direnc_mesafe":   direnc_mesafe,
-            "destek_uzerinde": bool(destek_mesafe <= 6),
-            "direnc_yakin":    bool(0 < direnc_mesafe <= 2),
-            "fib_382":         round(fib_382, 2),
-            "fib_618":         round(fib_618, 2),
-        }
-    except Exception:
-        sk = df['Close'].iloc[-1] if not df.empty else 1
-        return {"yuksek_52h": sk*1.5, "dusuk_52h": sk*0.5, "yakin_destek": sk*0.95,
-                "yakin_direnc": sk*1.1, "destek_mesafe": 5.0, "direnc_mesafe": 10.0,
-                "destek_uzerinde": False, "direnc_yakin": False,
-                "fib_382": sk*1.05, "fib_618": sk*0.97}
-
-# --- YENİ: HAFTALIK TREND ---
-def haftalik_trend_al(ticker):
-    """Haftalık zaman diliminde ana trend yönünü belirle (EMA10w > EMA20w)"""
-    try:
-        df_w = yf.Ticker(ticker).history(period="2y", interval="1wk", timeout=5)
-        if df_w.empty or len(df_w) < 20:
-            return None, None, None
-        ema10w = df_w['Close'].ewm(span=10, adjust=False).mean()
-        ema20w = df_w['Close'].ewm(span=20, adjust=False).mean()
-        rsi_w  = rsi_hesapla(df_w['Close'], 14)
-        haftalik_yukselis = bool(ema10w.iloc[-1] > ema20w.iloc[-1])
-        haftalik_rsi      = round(rsi_w.iloc[-1], 1)
-        haftalik_degisim  = round(
-            (df_w['Close'].iloc[-1] - df_w['Close'].iloc[-2]) / df_w['Close'].iloc[-2] * 100, 2)
-        return haftalik_yukselis, haftalik_rsi, haftalik_degisim
-    except Exception:
-        return None, None, None
-
-# --- YENİ: PİYASA GENELİ DURUMU ---
-def piyasa_durumu_al():
-    """BIST100, S&P500, BTC günlük trend durumunu döndür"""
-    def _endeks_kontrol(sembol, esik=-0.5):
-        try:
-            df = yf.Ticker(sembol).history(period="30d", interval="1d", timeout=4)
-            if df.empty or len(df) < 5:
-                return {"degisim": 0, "yukari": True, "pozitif": True, "getiri_10g": 0}
-            degisim = (df['Close'].iloc[-1] - df['Close'].iloc[-2]) / df['Close'].iloc[-2] * 100
-            ema20   = df['Close'].ewm(span=20, adjust=False).mean().iloc[-1]
-            getiri_10g = (df['Close'].iloc[-1] - df['Close'].iloc[-11]) / df['Close'].iloc[-11] * 100 \
-                         if len(df) >= 11 else 0
-            return {
-                "degisim":    round(degisim, 2),
-                "yukari":     bool(df['Close'].iloc[-1] > ema20),
-                "pozitif":    bool(degisim > esik),
-                "getiri_10g": round(getiri_10g, 2),
-            }
-        except Exception:
-            return {"degisim": 0, "yukari": True, "pozitif": True, "getiri_10g": 0}
-    return {
-        "bist": _endeks_kontrol("XU100.IS",  esik=-0.5),
-        "spy":  _endeks_kontrol("SPY",        esik=-0.5),
-        "btc":  _endeks_kontrol("BTC-USD",    esik=-1.0),
-    }
-
-# --- GELİŞTİRİLMİŞ TEK TEK SEMBOL TARAMA FONKSİYONU (v8 MAX KAZANÇ) ---
-def sembol_tara(ticker, piyasa, usd_try, acik_mi, piyasa_durumu=None, endeks_getiri=None):
+# --- TEK TEK SEMBOL TARAMA FONKSİYONU (THREAD İÇİN) ---
+def sembol_tara(ticker, piyasa, usd_try, acik_mi):
     try:
         df = yf.Ticker(ticker).history(period="1y", interval="1d", timeout=5)
         if df.empty or len(df) < 30:
@@ -765,443 +378,247 @@ def sembol_tara(ticker, piyasa, usd_try, acik_mi, piyasa_durumu=None, endeks_get
         
         yeterli_veri_var = len(df) >= 200
 
-        son_kapanis    = df['Close'].iloc[-1]
+        son_kapanis = df['Close'].iloc[-1]
         onceki_kapanis = df['Close'].iloc[-2]
         degisim = round(((son_kapanis - onceki_kapanis) / onceki_kapanis) * 100, 2)
 
-        # --- RSI ---
         df['RSI'] = rsi_hesapla(df['Close'], 14)
         rsi_val = round(df['RSI'].iloc[-1], 2) if not pd.isna(df['RSI'].iloc[-1]) else 50
 
-        # --- EMA ---
         df['EMA21'] = df['Close'].ewm(span=21, adjust=False).mean()
         ema21_val = df['EMA21'].iloc[-1]
+
         trend_yukselis = None
         if yeterli_veri_var:
-            ema50_val  = df['Close'].ewm(span=50,  adjust=False).mean().iloc[-1]
+            ema50_val = df['Close'].ewm(span=50, adjust=False).mean().iloc[-1]
             ema200_val = df['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
             trend_yukselis = bool(ema50_val > ema200_val)
 
-        # --- ROC (10 günlük momentum) ---
-        roc10 = round(((son_kapanis - df['Close'].iloc[-11]) / df['Close'].iloc[-11]) * 100, 2) \
-                if len(df) >= 11 else 0.0
+        if len(df) >= 11:
+            roc10 = round(((son_kapanis - df['Close'].iloc[-11]) / df['Close'].iloc[-11]) * 100, 2)
+        else:
+            roc10 = 0.0
 
-        # --- ATR ---
         df['ATR'] = atr_hesapla(df, 14)
         atr_val = df['ATR'].iloc[-1]
         if pd.isna(atr_val) or atr_val <= 0:
             atr_val = son_kapanis * 0.02
 
-        # --- Hacim ---
-        hacim_ort  = df['Volume'].rolling(window=20).mean().iloc[-1]
-        rvol       = round(df['Volume'].iloc[-1] / hacim_ort, 2) if hacim_ort > 0 else 1.0
-        hacim_yuksek  = bool(rvol >= 1.5)
-        hacim_kurumus = False
-        if len(df) >= 25:
-            son5_hacim    = df['Volume'].iloc[-6:-1].mean()
-            hacim_kurumus = bool(son5_hacim < hacim_ort * 0.7)
+        hacim_ort = df['Volume'].rolling(window=20).mean().iloc[-1]
+        hacim_yuksek = df['Volume'].iloc[-1] > hacim_ort * 1.2
 
-        # --- Bollinger Sıkışma ---
+        # Bollinger sıkışma (squeeze)
         sikisma = False
         if len(df) >= 130:
             genislik = bollinger_genislik_hesapla(df, 20, 2)
-            gecerli  = genislik.dropna()
-            if len(gecerli) >= 120:
-                esik    = gecerli.iloc[-120:].quantile(0.2)
+            gecerli_genislik = genislik.dropna()
+            if len(gecerli_genislik) >= 120:
+                esik = gecerli_genislik.iloc[-120:].quantile(0.2)
                 sikisma = bool(genislik.iloc[-1] <= esik)
 
-        # --- OBV Birikim/Dağıtım ---
-        birikim = dagitim = False
-        if len(df) >= 15:
-            obv           = obv_hesapla(df)
-            obv_degisim   = obv.iloc[-1] - obv.iloc[-11]
-            fiyat_deg_10  = abs((son_kapanis - df['Close'].iloc[-11]) / df['Close'].iloc[-11] * 100)
-            birikim  = bool(obv_degisim > 0 and fiyat_deg_10 < 3)
-            dagitim  = bool(obv_degisim < 0 and fiyat_deg_10 < 3)
+        # Hacim kuruması
+        hacim_kurumus = False
+        if len(df) >= 25:
+            son5_hacim = df['Volume'].iloc[-6:-1].mean()
+            hacim_kurumus = bool(son5_hacim < hacim_ort * 0.7)
 
-        # --- DMI / ADX ---
+        # OBV birikim/dağıtım
+        birikim = False
+        dagitim = False
+        if len(df) >= 15:
+            obv = obv_hesapla(df)
+            obv_degisim = obv.iloc[-1] - obv.iloc[-11]
+            fiyat_degisim_10 = abs((son_kapanis - df['Close'].iloc[-11]) / df['Close'].iloc[-11] * 100)
+            birikim = bool(obv_degisim > 0 and fiyat_degisim_10 < 3)
+            dagitim = bool(obv_degisim < 0 and fiyat_degisim_10 < 3)
+
+        # DI+/DI- (DMI) ve ADX (Trend Gücü)
         di_plus, di_minus, adx = dmi_adx_hesapla(df, 14)
-        di_yukselis_baskin = bool(di_plus.iloc[-1] > di_minus.iloc[-1])
+        di_plus_val = di_plus.iloc[-1]
+        di_minus_val = di_minus.iloc[-1]
+        di_yukselis_baskin = bool(di_plus_val > di_minus_val)
         adx_val = round(adx.iloc[-1], 2) if not pd.isna(adx.iloc[-1]) else 20.0
 
-        # --- MACD ---
+        # MACD (Trend Momentum)
         macd_line, signal_line, macd_hist = macd_hesapla(df['Close'], 12, 26, 9)
-        macd_val      = round(macd_line.iloc[-1],   4) if not pd.isna(macd_line.iloc[-1])   else 0.0
-        macd_sig      = round(signal_line.iloc[-1], 4) if not pd.isna(signal_line.iloc[-1]) else 0.0
-        macd_hist_val = round(macd_hist.iloc[-1],   4) if not pd.isna(macd_hist.iloc[-1])   else 0.0
-        macd_bullish  = bool(macd_val > macd_sig)
+        macd_val = round(macd_line.iloc[-1], 4) if not pd.isna(macd_line.iloc[-1]) else 0.0
+        macd_sig = round(signal_line.iloc[-1], 4) if not pd.isna(signal_line.iloc[-1]) else 0.0
+        macd_hist_val = round(macd_hist.iloc[-1], 4) if not pd.isna(macd_hist.iloc[-1]) else 0.0
+        macd_bullish = bool(macd_val > macd_sig)
 
-        # --- Stochastic RSI ---
-        stoch_k, stoch_d = stoch_rsi_hesapla(df['Close'])
-        stoch_k_val = round(stoch_k.iloc[-1], 1)
-        stoch_d_val = round(stoch_d.iloc[-1], 1)
-        stoch_bullish = bool(stoch_k_val > stoch_d_val and stoch_k_val < 80 and stoch_k_val > 20)
+        # Göreceli Hacim (RVOL)
+        rvol = round(df['Volume'].iloc[-1] / hacim_ort, 2) if hacim_ort > 0 else 1.0
+        hacim_yuksek = bool(rvol >= 1.5)
 
-        # --- Mum Formasyonu ---
-        mum_adi, mum_bullish = mum_formasyonu_tara(df)
-
-        # --- Destek / Direnç ---
-        dr = destek_direnc_hesapla(df)
-
-        # --- Haftalık Trend ---
-        haftalik_yukselis, haftalik_rsi, haftalik_degisim = haftalik_trend_al(ticker)
-
-        # --- YENİ: EMA9/21 Crossover ---
-        ema_crossover_yukari, ema_crossover_asagi = ema_crossover_hesapla(df)
-
-        # --- YENİ: Hacim Güç Oranı ---
-        hacim_guc_orani = hacim_guc_orani_hesapla(df, 10)
-        hacim_guc_pozitif = bool(hacim_guc_orani >= 1.3)
-
-        # --- YENİ: RSI Uyumsuzluğu (Bullish Divergence) ---
-        rsi_uyumsuzlugu = rsi_uyumsuzlugu_hesapla(df, 20)
-
-        # --- YENİ: Geç Alım Riski ---
-        gec_alim_riski, zirve_yakin, hizli_yukselis = gec_alim_riski_hesapla(df)
-
-        # --- YENİ: Volatilite Kalitesi ---
-        volatilite_kalitesi = volatilite_kalitesi_hesapla(df, atr_val)
-
-        # --- YENİ: Bollinger Kırılış ---
-        bollinger_kirilis = bool(sikisma and rvol >= 2.0)
-
-        # --- Üçgen Yapısı ---
+        # Sıkışma içi üçgen yapısı
         ucgen_tip = ucgen_tipi_belirle(df, 20)
 
-        # --- Yön Eğilimi ---
+        # Yön Eğilimi Skoru
         yon_puan = 0
-        if di_yukselis_baskin:          yon_puan += 1
-        else:                           yon_puan -= 1
-        if birikim:                     yon_puan += 1
-        if dagitim:                     yon_puan -= 1
-        if ucgen_tip == "yukselen":     yon_puan += 1
-        elif ucgen_tip == "alcalan":    yon_puan -= 1
-        if trend_yukselis is True:      yon_puan += 1
-        elif trend_yukselis is False:   yon_puan -= 1
-        if haftalik_yukselis is True:   yon_puan += 1
-        elif haftalik_yukselis is False: yon_puan -= 1
+        if di_yukselis_baskin: yon_puan += 1
+        else: yon_puan -= 1
+        if birikim: yon_puan += 1
+        if dagitim: yon_puan -= 1
+        if ucgen_tip == "yukselen": yon_puan += 1
+        elif ucgen_tip == "alcalan": yon_puan -= 1
+        if trend_yukselis is True: yon_puan += 1
+        elif trend_yukselis is False: yon_puan -= 1
 
-        if yon_puan >= 2:    yon_bias = "Yukarı"
-        elif yon_puan <= -2: yon_bias = "Aşağı"
-        else:                yon_bias = "Nötr"
+        if yon_puan >= 2:
+            yon_bias = "Yukarı"
+        elif yon_puan <= -2:
+            yon_bias = "Aşağı"
+        else:
+            yon_bias = "Nötr"
 
-        # --- Hareket Aralığı ---
-        menzil_genislik = df['High'].iloc[-30:].max() - df['Low'].iloc[-30:].min() \
-                          if len(df) >= 30 else atr_val * 5
+        # Hareket aralığı
+        if len(df) >= 30:
+            menzil_genislik = df['High'].iloc[-30:].max() - df['Low'].iloc[-30:].min()
+        else:
+            menzil_genislik = atr_val * 5
         menzil_yukari = son_kapanis + menzil_genislik
-        menzil_asagi  = max(son_kapanis - menzil_genislik, son_kapanis * 0.5)
+        menzil_asagi = max(son_kapanis - menzil_genislik, son_kapanis * 0.5)
 
-        # --- Temel Bayraklar ---
-        rsi_genel   = (45 <= rsi_val <= 70)
-        ema_uygun   = (son_kapanis > ema21_val)
+        rsi_genel = (45 <= rsi_val <= 70)
+        ema_uygun = (son_kapanis > ema21_val)
         rsi_garanti = (45 <= rsi_val <= 65)
+
+        # Patlama potansiyeli tespiti (Bollinger daralma + akıllı para girişi)
         patlama_adayi = bool(sikisma and birikim)
 
-        # --- Alım Aralığı ---
+        # Alım Aralığı [Min - Max]
         alim_min = ema21_val * 0.97
         alim_max = ema21_val * 1.01
+        
+        # Alım Durumu
         fark_yuzde = (son_kapanis - alim_max) / son_kapanis * 100
-        if son_kapanis <= alim_max:   alim_durum = "ŞİMDİ"
-        elif fark_yuzde <= 2.5:       alim_durum = "YAKIN"
-        else:                         alim_durum = "BEKLE"
+        if son_kapanis <= alim_max:
+            alim_durum = "ŞİMDİ"
+        elif fark_yuzde <= 2.5:
+            alim_durum = "YAKIN"
+        else:
+            alim_durum = "BEKLE"
 
-        # --- Stop / Hedef ---
-        stop_val    = max(son_kapanis - atr_val * 2.0, son_kapanis * 0.9)
-        kar_hedef_1 = son_kapanis + atr_val * 1.5
-        kar_hedef_2 = son_kapanis + atr_val * 3.0
-        risk        = son_kapanis - stop_val
+        # Risk analizinde alım fiyatı olarak güncel kapanış fiyatı kullanılır
+        risk_buy_price = son_kapanis
+
+        # Stop-Loss: Giriş fiyatının 2.0 * ATR altı (Zararı %3-5 arasında sınırlar)
+        stop_val = son_kapanis - (atr_val * 2.0)
+        if stop_val <= 0:
+            stop_val = son_kapanis * 0.9
+
+        # Kâr Hedefi 1 (Kısmi Satış Hedefi: 1.5 * ATR üzeri)
+        kar_hedef_1 = son_kapanis + (atr_val * 1.5)
+
+        # Kâr Hedefi 2 (Ana Kırılım Hedefi: 3.0 * ATR üzeri)
+        kar_hedef_2 = son_kapanis + (atr_val * 3.0)
+
+        # Risk/Ödül Oranları (R/O)
+        risk = son_kapanis - stop_val
         ro_1 = round((kar_hedef_1 - son_kapanis) / risk, 2) if risk > 0 else 0
         ro_2 = round((kar_hedef_2 - son_kapanis) / risk, 2) if risk > 0 else 0
-        beklenen_kar_yuzde_1 = round(((kar_hedef_1 - son_kapanis) / son_kapanis) * 100, 2)
-        beklenen_kar_yuzde_2 = round(((kar_hedef_2 - son_kapanis) / son_kapanis) * 100, 2)
 
-        # --- YENİ: Göreceli Güç (RS) ---
-        rs_guclu = False
-        if endeks_getiri is not None:
-            endeks_10g = endeks_getiri.get(piyasa["id"], 0)
-            rs_guclu   = bool(roc10 > endeks_10g + 2)
+        # Beklenen Kâr Yüzdeleri
+        beklenen_kar_yuzde_1 = round(((kar_hedef_1 - son_kapanis) / son_kapanis) * 100, 2) if son_kapanis > 0 else 0
+        beklenen_kar_yuzde_2 = round(((kar_hedef_2 - son_kapanis) / son_kapanis) * 100, 2) if son_kapanis > 0 else 0
 
-        # =========================================================
-        # v8 MAX KAZANÇ: GELİŞMİŞ AĞIRLIKLI SKORLAMA SİSTEMİ
-        # =========================================================
-        skor = 10  # Baz puan
-
-        # Temel teknik indikatörler
-        if rsi_genel:           skor += 10
-        if ema_uygun:           skor += 15
-        if trend_yukselis:      skor += 20   # Günlük ana trend
-        if macd_bullish:        skor += 15
-
-        # Trend gücü
-        if adx_val >= 25:       skor += 12
-        elif adx_val >= 20:     skor +=  5
-        elif adx_val < 18:      skor -= 10
-
-        # Hacim
-        if rvol >= 1.5:         skor += 10
-        elif rvol >= 1.0:       skor +=  5
-
-        # Momentum
-        if roc10 > 0:           skor +=  5
-
-        # Risk/Ödül
-        if ro_2 >= 1.5:         skor += 10
-
-        # Özel sinyaller
-        if sikisma:             skor += 10
-        if hacim_kurumus:       skor +=  4
-        if birikim:             skor += 10
-        if patlama_adayi:       skor += 12
-
-        # Yön eğilimi
+        # Gelişmiş Skorlama
+        skor = 10
+        if rsi_genel: skor += 10
+        if ema_uygun: skor += 15
+        if trend_yukselis: skor += 20
+        if macd_bullish: skor += 15
+        if adx_val >= 25: skor += 10
+        elif adx_val < 18: skor -= 10
+        if rvol >= 1.5: skor += 15
+        elif rvol >= 1.0: skor += 5
+        if roc10 > 0: skor += 5
+        if ro_2 >= 1.5: skor += 10
+        if sikisma: skor += 8
+        if hacim_kurumus: skor += 4
+        if birikim: skor += 8
+        if patlama_adayi: skor += 15
         if yon_bias == "Yukarı": skor += 10
         elif yon_bias == "Aşağı": skor -= 15
 
-        # Haftalık trend teyidi (en kritik faktör)
-        if haftalik_yukselis is True:    skor += 25
-        elif haftalik_yukselis is False: skor -= 20
-
-        # Destek / Direnç
-        if dr["destek_uzerinde"]:  skor += 10
-        if dr["direnc_yakin"]:     skor -= 10  # Direçte satış baskısı var
-
-        # Mum formasyonu
-        if mum_bullish:            skor += 15
-
-        # Stochastic RSI onayı
-        if stoch_bullish:          skor +=  8
-        elif stoch_k_val >= 80:    skor -=  5   # Aşırı alım
-
-        # Göreceli Güç (endeks üstü performans)
-        if rs_guclu:               skor += 15
-
-        # Piyasa geneli durumu
-        piyasa_pozitif = True
-        if piyasa_durumu:
-            pid = piyasa["id"]
-            if pid == "TR":
-                pd_info = piyasa_durumu.get("bist", {})
-            elif pid == "US":
-                pd_info = piyasa_durumu.get("spy", {})
-            else:
-                pd_info = piyasa_durumu.get("btc", {})
-            piyasa_pozitif = pd_info.get("pozitif", True)
-            if pd_info.get("yukari", True): skor += 10
-            else:                           skor -= 20
-
-        # =========================================================
-        # YENİ: v8 MAX KAZANÇ EK SKORLARI
-        # =========================================================
-
-        # EMA9/21 Crossover — kısa vadeli en güçlü sinyal
-        if ema_crossover_yukari:        skor += 20
-        elif ema_crossover_asagi:       skor -= 15  # Ölüm çarpazı
-
-        # Hacim Güç Oranı — akıllı para yönü
-        if hacim_guc_orani >= 2.0:      skor += 15
-        elif hacim_guc_orani >= 1.3:    skor += 10
-        elif hacim_guc_orani < 0.7:     skor -= 10  # Düşen günler baskın
-
-        # RSI Uyumsuzluğu — gizli boğa sinyali
-        if rsi_uyumsuzlugu:             skor += 15
-
-        # Geç Alım Riski — FALSE POSITIVE önleme (kritik ceza)
-        if gec_alim_riski:              skor -= 25
-
-        # Volatilite Kalitesi
-        if volatilite_kalitesi:         skor +=  8
-
-        # Bollinger Kırılış (Sıkışma + Yüksek Hacim)
-        if bollinger_kirilis:            skor += 15
-
-        # =========================================================
-        # GARANTİ KOŞULLARI (Sıkı + Geç Alım Koruması)
-        # =========================================================
+        # Garanti Koşulları (Backtest Optimizasyonlu Güvenli Filtreler)
         garanti = (
-            skor >= 90 and
+            skor >= 75 and
             ro_2 >= 1.1 and
             rsi_garanti and
             (trend_yukselis is True) and
-            (haftalik_yukselis is True) and
             macd_bullish and
             (yon_bias != "Aşağı") and
-            (adx_val >= 22.0) and
-            piyasa_pozitif and
-            not dr["direnc_yakin"] and
-            not gec_alim_riski              # YENİ: geç alım sinyali değil
-        )
-
-        # Üçlü Onay (3 zaman dilimi uyumlu + tüm momentum pozitif)
-        uclu_onay = bool(
-            trend_yukselis is True and
-            haftalik_yukselis is True and
-            macd_bullish and
-            stoch_bullish and
-            yon_bias == "Yukarı" and
-            birikim
+            (adx_val >= 20.0)
         )
 
         skor_goster = skor + 5 if (garanti and rsi_garanti) else skor
-        if ro_2 >= 2.5 and garanti: skor_goster += 5
+        if ro_2 >= 2.5 and garanti:
+            skor_goster += 5
 
-        # =========================================================
-        # YENİ: GÜVEN % (0-100 normalize)
-        # =========================================================
-        # Maksimum teorik skor hesabı
-        MAX_SKOR = 260
-        guven_yuzde = max(0, min(100, round((skor_goster / MAX_SKOR) * 100)))
-
-        # =========================================================
-        # ERTESİ GÜN ANALİZİ
-        # =========================================================
-        kapanis_gucu_pct  = kapanis_gucu_hesapla(df)
-        gun_oruntu_adi, _ = gun_ici_oruntu_tespit(df)
-        ardisik_yukselen  = ardisik_yukselen_dipler(df, 3)
-
-        ertesi_gun_skoru_val = ertesi_gun_skoru_hesapla(
-            df, rsi_val, rvol, trend_yukselis, haftalik_yukselis,
-            mum_bullish, ema_crossover_yukari, gec_alim_riski,
-            piyasa_pozitif, roc10, adx_val, stoch_k_val
-        )
-
-        # Tahmini açılış yönü
-        if   ertesi_gun_skoru_val >= 72: acilis_yonu = "↑ Güçlü"
-        elif ertesi_gun_skoru_val >= 58: acilis_yonu = "↗ Pozitif"
-        elif ertesi_gun_skoru_val >= 42: acilis_yonu = "→ Nötr"
-        elif ertesi_gun_skoru_val >= 28: acilis_yonu = "↘ Zayıf"
-        else:                            acilis_yonu = "↓ Negatif"
-
-        # Yarın AL: bugün + yarın aynı anda güçlü
-        yarin_al = bool(
-            ertesi_gun_skoru_val >= 65 and
-            kapanis_gucu_pct >= 60 and
-            (trend_yukselis is True) and
-            not gec_alim_riski
-        )
-
-        # =========================================================
-        # YENİ: DİNAMİK FİBONACCİ HEDEFLERİ
-        # =========================================================
-        # Hedef 1: ATR x 1.5 veya yakın Fibonacci direnci (hangisi düşükse değil, anlamlıysa Fib kullan)
-        fib_direnc = dr.get("yakin_direnc", son_kapanis + atr_val * 2)
-        fib_hedef_mesafe = fib_direnc - son_kapanis
-        if fib_hedef_mesafe > atr_val * 0.5:  # Fibonacci hedefi mantıklıysa kullan
-            kar_hedef_1 = min(son_kapanis + atr_val * 1.5, fib_direnc)
-            kar_hedef_2 = fib_direnc if fib_hedef_mesafe > atr_val else son_kapanis + atr_val * 3.0
-        else:
-            kar_hedef_1 = son_kapanis + atr_val * 1.5
-            kar_hedef_2 = son_kapanis + atr_val * 3.0
-
-        ro_1 = round((kar_hedef_1 - son_kapanis) / risk, 2) if risk > 0 else 0
-        ro_2 = round((kar_hedef_2 - son_kapanis) / risk, 2) if risk > 0 else 0
-        beklenen_kar_yuzde_1 = round(((kar_hedef_1 - son_kapanis) / son_kapanis) * 100, 2)
-        beklenen_kar_yuzde_2 = round(((kar_hedef_2 - son_kapanis) / son_kapanis) * 100, 2)
-
-        # --- Kripto birimini TL'ye çevir ---
+        # Kripto birimini TL'ye çevir
         if piyasa["id"] == "KR":
-            for attr in ["son_kapanis", "ema21_val", "alim_min", "alim_max",
-                         "stop_val", "kar_hedef_1", "kar_hedef_2",
-                         "menzil_yukari", "menzil_asagi"]:
-                locals_val = locals()[attr]
-                locals()[attr] = locals_val * usd_try
-            son_kapanis  *= usd_try
-            ema21_val    *= usd_try
-            alim_min     *= usd_try
-            alim_max     *= usd_try
-            stop_val     *= usd_try
-            kar_hedef_1  *= usd_try
-            kar_hedef_2  *= usd_try
-            menzil_yukari *= usd_try
-            menzil_asagi  *= usd_try
-            if dr:
-                dr["yakin_destek"] *= usd_try
-                dr["yakin_direnc"] *= usd_try
+            son_kapanis = son_kapanis * usd_try
+            ema21_val = ema21_val * usd_try
+            alim_min = alim_min * usd_try
+            alim_max = alim_max * usd_try
+            stop_val = stop_val * usd_try
+            kar_hedef_1 = kar_hedef_1 * usd_try
+            kar_hedef_2 = kar_hedef_2 * usd_try
+            menzil_yukari = menzil_yukari * usd_try
+            menzil_asagi = menzil_asagi * usd_try
 
         fiyat_guncel = round(son_kapanis, 2)
         gosterim_adi = ticker.replace(".IS", "").replace("-USD", "TRY")
-        birim   = "₺" if piyasa["id"] in ["TR", "KR"] else "$"
+        birim = "₺" if piyasa["id"] in ["TR", "KR"] else "$"
         tv_link = tv_linki_olustur(gosterim_adi, piyasa["id"])
 
         if alim_max > stop_val and fiyat_guncel > stop_val:
             return {
-                "symbol":              gosterim_adi,
-                "fiyat":               fiyat_guncel,
-                "birim":               birim,
-                "degisim":             degisim,
-                "rsi":                 rsi_val,
-                "skor":                skor_goster,
-                "alim_min":            round(alim_min, 2),
-                "alim_max":            round(alim_max, 2),
-                "alim_durum":          alim_durum,
-                "stop":                round(stop_val, 2),
-                "kar_hedef_1":         round(kar_hedef_1, 2),
-                "kar_hedef_2":         round(kar_hedef_2, 2),
-                "ro_1":                ro_1,
-                "ro_2":                ro_2,
+                "symbol": gosterim_adi,
+                "fiyat": fiyat_guncel,
+                "birim": birim,
+                "degisim": degisim,
+                "rsi": rsi_val,
+                "skor": skor_goster,
+                "alim_min": round(alim_min, 2),
+                "alim_max": round(alim_max, 2),
+                "alim_durum": alim_durum,
+                "stop": round(stop_val, 2),
+                "kar_hedef_1": round(kar_hedef_1, 2),
+                "kar_hedef_2": round(kar_hedef_2, 2),
+                "ro_1": ro_1,
+                "ro_2": ro_2,
                 "beklenen_kar_yuzde_1": beklenen_kar_yuzde_1,
                 "beklenen_kar_yuzde_2": beklenen_kar_yuzde_2,
-                "trend_yukselis":      trend_yukselis,
-                "haftalik_yukselis":   haftalik_yukselis,
-                "haftalik_rsi":        haftalik_rsi,
-                "sikisma":             sikisma,
-                "hacim_kurumus":       hacim_kurumus,
-                "birikim":             birikim,
-                "birikim_raw":         birikim,
-                "dagitim":             dagitim,
-                "yon_bias":            yon_bias,
-                "ucgen_tip":           ucgen_tip,
-                "menzil_yukari":       round(menzil_yukari, 2),
-                "menzil_asagi":        round(menzil_asagi, 2),
-                "roc10":               roc10,
-                "garanti":             garanti,
-                "uclu_onay":           uclu_onay,
-                "acik_mi":             acik_mi,
-                "hacim_yuksek":        hacim_yuksek,
-                "piyasa_id":           piyasa["id"],
-                "tv_link":             tv_link,
-                "patlama_adayi":       patlama_adayi,
-                "adx":                 adx_val,
-                "macd_bullish":        macd_bullish,
-                "macd_val":            macd_val,
-                "macd_sig":            macd_sig,
-                "macd_hist":           macd_hist_val,
-                "rvol":                rvol,
-                "stoch_k":             stoch_k_val,
-                "stoch_d":             stoch_d_val,
-                "mum_adi":             mum_adi,
-                "mum_bullish":         mum_bullish,
-                "rs_guclu":            rs_guclu,
-                "destek":              dr["yakin_destek"],
-                "direnc":              dr["yakin_direnc"],
-                "destek_mesafe":       dr["destek_mesafe"],
-                "direnc_mesafe":       dr["direnc_mesafe"],
-                "yuksek_52h":          dr["yuksek_52h"],
-                "dusuk_52h":           dr["dusuk_52h"],
-                # v8 MAX KAZANÇ yeni alanlar
-                "ema_crossover_yukari":  ema_crossover_yukari,
-                "ema_crossover_asagi":   ema_crossover_asagi,
-                "hacim_guc_orani":       hacim_guc_orani,
-                "hacim_guc_pozitif":     hacim_guc_pozitif,
-                "rsi_uyumsuzlugu":       rsi_uyumsuzlugu,
-                "gec_alim_riski":        gec_alim_riski,
-                "zirve_yakin":           zirve_yakin,
-                "hizli_yukselis":        hizli_yukselis,
-                "volatilite_kalitesi":   volatilite_kalitesi,
-                "bollinger_kirilis":     bollinger_kirilis,
-                "guven_yuzde":           guven_yuzde,
-                # Ertesi Gün Analizi
-                "kapanis_gucu_pct":      kapanis_gucu_pct,
-                "gun_oruntu_adi":        gun_oruntu_adi,
-                "ardisik_yukselen":      ardisik_yukselen,
-                "ertesi_gun_skoru":      ertesi_gun_skoru_val,
-                "acilis_yonu":           acilis_yonu,
-                "yarin_al":              yarin_al,
+                "trend_yukselis": trend_yukselis,
+                "sikisma": sikisma,
+                "hacim_kurumus": hacim_kurumus,
+                "birikim": birikim,
+                "birikim_raw": birikim,
+                "dagitim": dagitim,
+                "yon_bias": yon_bias,
+                "ucgen_tip": ucgen_tip,
+                "menzil_yukari": round(menzil_yukari, 2),
+                "menzil_asagi": round(menzil_asagi, 2),
+                "roc10": roc10,
+                "garanti": garanti,
+                "acik_mi": acik_mi,
+                "hacim_yuksek": hacim_yuksek,
+                "piyasa_id": piyasa["id"],
+                "tv_link": tv_link,
+                "patlama_adayi": patlama_adayi,
+                "adx": adx_val,
+                "macd_bullish": macd_bullish,
+                "macd_val": macd_val,
+                "macd_sig": macd_sig,
+                "macd_hist": macd_hist_val,
+                "rvol": rvol
             }
     except Exception as e:
         if VERBOSE:
-            print(f"Hata ({ticker}): {str(e)[:80]}")
+            print(f"Hata ({ticker}): {str(e)[:50]}")
     return None
-
 
 # --- JSON SERIALIZATION HELPER FOR NUMPY ---
 class NumpyEncoder(json.JSONEncoder):
@@ -1260,7 +677,7 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
             font-family: 'Inter', sans-serif;
             background-color: var(--bg-main);
             color: var(--text-main);
-            padding: 1rem;
+            padding: 2rem;
             min-height: 100vh;
             background-image: 
                 radial-gradient(circle at 10% 20%, rgba(16, 185, 129, 0.04) 0%, transparent 40%),
@@ -1368,20 +785,12 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
             padding: 1.25rem;
             backdrop-filter: blur(8px);
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-            transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s;
-            cursor: pointer;
-            user-select: none;
+            transition: transform 0.2s, border-color 0.2s;
         }}
 
         .card:hover {{
-            transform: translateY(-3px);
-            border-color: rgba(255, 255, 255, 0.2);
-            box-shadow: 0 8px 20px rgba(0,0,0,0.2);
-        }}
-
-        .card.active {{
-            border-color: var(--primary);
-            box-shadow: 0 0 16px var(--primary-glow);
+            transform: translateY(-2px);
+            border-color: rgba(255, 255, 255, 0.12);
         }}
 
         .card-header {{
@@ -1518,22 +927,21 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
             width: 100%;
             border-collapse: collapse;
             text-align: left;
-            font-size: 0.72rem;
+            font-size: 0.85rem;
         }}
 
         th {{
             background: rgba(10, 15, 30, 0.5);
             font-weight: 600;
             color: var(--text-muted);
-            font-size: 0.65rem;
+            font-size: 0.75rem;
             text-transform: uppercase;
-            letter-spacing: 0.03em;
-            padding: 0.6rem 0.5rem;
+            letter-spacing: 0.05em;
+            padding: 1rem;
             border-bottom: 1px solid var(--border-color);
             cursor: pointer;
             user-select: none;
             transition: color 0.2s;
-            white-space: nowrap;
         }}
 
         th:hover {{
@@ -1541,10 +949,9 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
         }}
 
         td {{
-            padding: 0.5rem 0.5rem;
+            padding: 0.9rem 1rem;
             border-bottom: 1px solid var(--border-color);
             vertical-align: middle;
-            white-space: nowrap;
         }}
 
         tr:last-child td {{
@@ -1639,16 +1046,6 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
             color: var(--text-muted);
             font-size: 0.95rem;
         }}
-        .badge-gunluk { background: rgba(234, 88, 12, 0.15); color: #f97316; border: 1px solid rgba(249,115,22,0.3); }
-        .badge-haftalik { background: rgba(139, 92, 246, 0.15); color: #a78bfa; border: 1px solid rgba(167,139,250,0.3); }
-        .badge-late { background: rgba(239, 68, 68, 0.12); color: #fca5a5; border: 1px solid rgba(239,68,68,0.3); }
-        .badge-div { background: rgba(6, 182, 212, 0.12); color: #67e8f9; border: 1px solid rgba(6,182,212,0.3); }
-        .badge-cross { background: rgba(16, 185, 129, 0.15); color: #6ee7b7; border: 1px solid rgba(16,185,129,0.3); }
-
-        .guven-bar-wrap { display: flex; align-items: center; gap: 5px; }
-        .guven-bar { height: 5px; border-radius: 3px; background: rgba(255,255,255,0.08); flex: 1; overflow: hidden; }
-        .guven-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
-        .guven-label { font-size: 0.68rem; font-weight: 700; min-width: 28px; text-align: right; }
     </style>
 </head>
 <body>
@@ -1658,7 +1055,7 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
                 <div class="logo-icon">AG</div>
                 <div class="logo-title">
                     <h1>Borsa &amp; Kripto Tarama Paneli</h1>
-                    <p>Antigravity Engine v8 MAX KAZANÇ • Günlük &amp; Haftalık Optimizasyon</p>
+                    <p>Antigravity Engine v7 • Canlı Tarama Verileri</p>
                 </div>
             </div>
             <div class="stats-bar">
@@ -1680,7 +1077,7 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
 
         <!-- Summary Cards -->
         <div class="cards-grid">
-            <div class="card" id="cardbox-total" onclick="cardFilter('total')" title="Tüm hisseleri göster">
+            <div class="card">
                 <div class="card-header">
                     <span>Toplam Taranan</span>
                     <span style="font-size:1.1rem">🔍</span>
@@ -1688,7 +1085,7 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
                 <div class="card-value" id="card-total">0</div>
                 <div class="card-desc">Aktif sembol listesi büyüklüğü</div>
             </div>
-            <div class="card" id="cardbox-guaranteed" onclick="cardFilter('guaranteed')" title="Sadece Garanti sinyalleri göster">
+            <div class="card">
                 <div class="card-header">
                     <span>Garanti Sinyaller</span>
                     <span style="font-size:1.1rem">🛡️</span>
@@ -1696,7 +1093,7 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
                 <div class="card-value text-green" id="card-guaranteed">0</div>
                 <div class="card-desc">RSI, Trend ve Yön uyumlu AL sinyalleri</div>
             </div>
-            <div class="card" id="cardbox-breakout" onclick="cardFilter('breakout')" title="Patlama adaylarını göster">
+            <div class="card">
                 <div class="card-header">
                     <span>Patlama Adayları</span>
                     <span style="font-size:1.1rem">🚀</span>
@@ -1704,7 +1101,7 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
                 <div class="card-value" id="card-breakouts" style="color: #3b82f6 !important;">0</div>
                 <div class="card-desc">Sıkışma + Birikim (Yüksek Kâr Adayı)</div>
             </div>
-            <div class="card" id="cardbox-squeeze" onclick="cardFilter('squeeze')" title="Sıkışan hisseleri göster">
+            <div class="card">
                 <div class="card-header">
                     <span>Sıkışan (Squeeze)</span>
                     <span style="font-size:1.1rem">🌀</span>
@@ -1712,21 +1109,13 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
                 <div class="card-value text-yellow" id="card-squeeze">0</div>
                 <div class="card-desc">Bollinger squeeze durumundaki semboller</div>
             </div>
-            <div class="card" id="cardbox-accumulation" onclick="cardFilter('accumulation')" title="OBV birikim hisselerini göster">
+            <div class="card">
                 <div class="card-header">
                     <span>Para Akışı Birikim</span>
                     <span style="font-size:1.1rem">📥</span>
                 </div>
                 <div class="card-value text-blue" id="card-accumulation">0</div>
                 <div class="card-desc">Fiyat sabitken hacmi artan (OBV)</div>
-            </div>
-            <div class="card" id="cardbox-yarin" onclick="cardFilter('yarin')" title="Ertesi gün için güçlü setup">
-                <div class="card-header">
-                    <span>🔮 Yarın İçin</span>
-                    <span style="font-size:1.1rem">🌙</span>
-                </div>
-                <div class="card-value" id="card-yarin" style="color:#a78bfa !important;">0</div>
-                <div class="card-desc">Güçlü kapanış + ertesi gün skoru ≥65</div>
             </div>
         </div>
 
@@ -1755,21 +1144,6 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
                 <button class="filter-chip" id="chip-now" onclick="toggleFilter('now')">
                     🟢 Alım: ŞİMDİ
                 </button>
-                <button class="filter-chip" id="chip-gunluk" onclick="toggleFilter('gunluk')">
-                    📅 Günlük Sinyal
-                </button>
-                <button class="filter-chip" id="chip-haftalik" onclick="toggleFilter('haftalik')">
-                    📆 Haftalık Swing
-                </button>
-                <button class="filter-chip" id="chip-crossover" onclick="toggleFilter('crossover')">
-                    ✂️ EMA Crossover
-                </button>
-                <button class="filter-chip" id="chip-divergence" onclick="toggleFilter('divergence')">
-                    🔄 RSI Div.
-                </button>
-                <button class="filter-chip" id="chip-yarin" onclick="toggleFilter('yarin')">
-                    🔮 Yarın AL
-                </button>
             </div>
 
             <div class="search-container">
@@ -1795,13 +1169,11 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
                         <th onclick="handleSort('alim_max')">Alım Aralığı</th>
                         <th onclick="handleSort('stop')">Stop-Loss</th>
                         <th onclick="handleSort('kar_hedef_1')">Hedef 1 (Kısmi)</th>
-                        <th onclick="handleSort('kar_hedef_2')">Hedef 2 (Fib)</th>
+                        <th onclick="handleSort('kar_hedef_2')">Hedef 2 (Patlama)</th>
                         <th onclick="handleSort('ro_2')">R/O Oranı</th>
                         <th onclick="handleSort('beklenen_kar_yuzde_2')">Beklenen Kâr</th>
-                        <th onclick="handleSort('guven_yuzde')">Güven %</th>
-                        <th onclick="handleSort('ertesi_gun_skoru')">Ertesi Gün</th>
+                        <th onclick="handleSort('menzil_yukari')">Olası Aralık</th>
                         <th onclick="handleSort('skor')">Skor</th>
-                        <th>Sinyaller</th>
                         <th>Durum</th>
                         <th>Grafik</th>
                     </tr>
@@ -1827,11 +1199,8 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
         let filterSqueeze = false;
         let filterAccumulation = false;
         let filterNow = false;
-        let filterGunluk = false;
-        let filterHaftalik = false;
-        let filterYarin = false;
         
-        let sortColumn = 'ertesi_gun_skoru'; // default: ertesi gün skoruna göre
+        let sortColumn = 'garanti'; // default
         let sortDirection = 'desc';
 
         // Başlangıç istatistikleri ve render
@@ -1843,7 +1212,6 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
         function updateCards() {{
             document.getElementById('card-total').innerText = dataset.length;
             document.getElementById('card-guaranteed').innerText = dataset.filter(x => x.garanti).length;
-            document.getElementById('card-yarin').innerText = dataset.filter(x => x.yarin_al).length;
             document.getElementById('card-breakouts').innerText = dataset.filter(x => x.patlama_adayi).length;
             document.getElementById('card-squeeze').innerText = dataset.filter(x => x.sikisma).length;
             document.getElementById('card-accumulation').innerText = dataset.filter(x => x.birikim_raw).length;
@@ -1879,56 +1247,7 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
             }} else if (filter === 'breakout') {{
                 filterBreakout = !filterBreakout;
                 document.getElementById('chip-breakout').classList.toggle('active', filterBreakout);
-            }} else if (filter === 'gunluk') {{
-                filterGunluk = !filterGunluk;
-                document.getElementById('chip-gunluk').classList.toggle('active', filterGunluk);
-            }} else if (filter === 'haftalik') {{
-                filterHaftalik = !filterHaftalik;
-                document.getElementById('chip-haftalik').classList.toggle('active', filterHaftalik);
-            }} else if (filter === 'crossover') {{
-                window._filterCrossover = !window._filterCrossover;
-                document.getElementById('chip-crossover').classList.toggle('active', window._filterCrossover);
-            }} else if (filter === 'divergence') {{
-                window._filterDivergence = !window._filterDivergence;
-                document.getElementById('chip-divergence').classList.toggle('active', window._filterDivergence);
-            }} else if (filter === 'yarin') {{
-                filterYarin = !filterYarin;
-                document.getElementById('chip-yarin').classList.toggle('active', filterYarin);
             }}
-            renderTable();
-        }}
-
-        let activeCardFilter = null;
-
-        function cardFilter(type) {{
-            // Tüm kartların active sınıfını kaldır
-            document.querySelectorAll('.card').forEach(c => c.classList.remove('active'));
-
-            // Tüm chip filtrelerini sıfırla
-            filterGuaranteed = false;
-            filterBreakout = false;
-            filterSqueeze = false;
-            filterAccumulation = false;
-            filterNow = false;
-
-            filterYarin = false;
-            if (activeCardFilter === type) {{
-                // Aynı karta tekrar tıklandı → filtreyi kaldır
-                activeCardFilter = null;
-            }} else {{
-                activeCardFilter = type;
-                // İlgili kartı aktif yap ve filtre uygula
-                const cardEl = document.getElementById('cardbox-' + type);
-                if (cardEl) cardEl.classList.add('active');
-
-                if (type === 'guaranteed') filterGuaranteed = true;
-                else if (type === 'breakout') filterBreakout = true;
-                else if (type === 'squeeze') filterSqueeze = true;
-                else if (type === 'accumulation') filterAccumulation = true;
-                else if (type === 'yarin') filterYarin = true;
-                // 'total' → filtre yok, tümünü göster
-            }}
-
             renderTable();
         }}
 
@@ -1981,17 +1300,6 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
                 if (filterSqueeze && !item.sikisma) return false;
                 if (filterAccumulation && !item.birikim_raw) return false;
                 if (filterNow && item.alim_durum !== 'ŞİMDİ') return false;
-                if (filterGunluk) {{
-                    const isGunluk = item.ema_crossover_yukari || item.patlama_adayi || (item.hacim_yuksek && item.mum_bullish);
-                    if (!isGunluk) return false;
-                }}
-                if (filterHaftalik) {{
-                    const isHaftalik = item.trend_yukselis && item.haftalik_yukselis && item.birikim_raw;
-                    if (!isHaftalik) return false;
-                }}
-                if (window._filterCrossover && !item.ema_crossover_yukari) return false;
-                if (window._filterDivergence && !item.rsi_uyumsuzlugu) return false;
-                if (filterYarin && !item.yarin_al) return false;
                 
                 return true;
             }});
@@ -2077,31 +1385,18 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
 
                 let durumBadge = '';
                 if (item.garanti) {{
-                    durumBadge = '<span class="badge badge-garanti">🛡️ Garanti AL</span>';
+                    durumBadge = '<span class="badge badge-garanti">🛡️ Garanti</span>';
                 }} else {{
                     if (item.skor >= 90) durumBadge = '<span class="badge badge-izl">İzle</span>';
                     else if (item.skor >= 70) durumBadge = '<span class="badge badge-near">Potansiyel</span>';
                     else durumBadge = '<span class="badge badge-wait">Bekle</span>';
                 }}
 
-                // Sinyal badge'leri
-                let signalBadges = '';
-                if (item.ema_crossover_yukari) signalBadges += '<span class="badge badge-cross" title="EMA9 EMA21\'i yukarı kesti">✂️ EMA Cross</span> ';
-                if (item.rsi_uyumsuzlugu) signalBadges += '<span class="badge badge-div" title="RSI Bullish Divergence — Gizli Boğa Sinyali">🔄 RSI Div</span> ';
-                if (item.bollinger_kirilis) signalBadges += '<span class="badge badge-cross" title="Bollinger Sıkışmadan Yüksek Hacimle Kırılış">💥 BB Kırılış</span> ';
-                if (item.gec_alim_riski) signalBadges += '<span class="badge badge-late" title="Geç Alım Riski: Zirvede veya Hızlı Yükselmiş">⚠️ Geç</span> ';
-                const isGunluk = item.ema_crossover_yukari || item.patlama_adayi || (item.hacim_yuksek && item.mum_bullish);
-                const isHaftalik = item.trend_yukselis && item.haftalik_yukselis && item.birikim_raw;
-                if (isGunluk) signalBadges += '<span class="badge badge-gunluk">📅 Günlük</span> ';
-                if (isHaftalik) signalBadges += '<span class="badge badge-haftalik">📆 Haftalık</span> ';
-
                 let icons = '';
                 if (item.hacim_yuksek) icons += '<span class="icon-badge" title="Yüksek Hacim">🔥</span>';
                 if (item.sikisma) icons += '<span class="icon-badge" title="Bant Sıkışması (Breakout Yakın)">🌀</span>';
                 if (item.birikim_raw) icons += '<span class="icon-badge" title="OBV Birikim (Akıllı Para Girişi)">📥</span>';
                 if (item.patlama_adayi) icons += '<span class="icon-badge" title="PATLAMA POTANSİYELİ! 🚀">🚀</span>';
-                if (item.ema_crossover_yukari) icons += '<span class="icon-badge" title="EMA Crossover">✂️</span>';
-                if (item.rsi_uyumsuzlugu) icons += '<span class="icon-badge" title="RSI Divergence">🔄</span>';
 
                 let alimAraligiStr = formatCurrency(item.alim_min, item.birim) + ' - ' + formatCurrency(item.alim_max, item.birim);
 
@@ -2127,22 +1422,10 @@ def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
                         <td class="text-green" style="font-weight:600;">${{formatCurrency(item.kar_hedef_2, item.birim)}}</td>
                         <td class="${{roRenk}}" style="text-align:center; font-weight:600;">${{item.ro_1}} / ${{item.ro_2}}</td>
                         <td class="${{karRenk}}">+${{item.beklenen_kar_yuzde_1.toFixed(0)}}% / +${{item.beklenen_kar_yuzde_2.toFixed(0)}}%</td>
-                        <td style="min-width:80px;">
-                            <div class="guven-bar-wrap">
-                                <div class="guven-bar"><div class="guven-bar-fill" style="width:${{item.guven_yuzde || 0}}%; background: ${{(item.guven_yuzde||0) >= 70 ? '#10b981' : (item.guven_yuzde||0) >= 50 ? '#f59e0b' : '#ef4444'}};"></div></div>
-                                <span class="guven-label" style="color:${{(item.guven_yuzde||0) >= 70 ? '#10b981' : (item.guven_yuzde||0) >= 50 ? '#f59e0b' : '#ef4444'}};">${{item.guven_yuzde || 0}}%</span>
-                            </div>
-                        </td>
-                        <td style="min-width:105px; text-align:center;">
-                            <div style="font-size:0.7rem; font-weight:700; color:${{(item.ertesi_gun_skoru||0)>=70?'#10b981':(item.ertesi_gun_skoru||0)>=50?'#f59e0b':'#9ca3af'}}">
-                                ${{item.acilis_yonu || '→'}}
-                            </div>
-                            <div class="guven-bar" style="margin-top:3px;"><div class="guven-bar-fill" style="width:${{item.ertesi_gun_skoru||0}}%; background:${{(item.ertesi_gun_skoru||0)>=70?'#a78bfa':(item.ertesi_gun_skoru||0)>=50?'#f59e0b':'#ef4444'}};"></div></div>
-                            <div style="font-size:0.65rem; color:#9ca3af; margin-top:2px;">${{item.ertesi_gun_skoru||0}}/100 ${{item.yarin_al?'🔮':''}} ${{item.ardisik_yukselen?'📶':''}}</div>
-                            <div style="font-size:0.6rem; color:#6b7280;">${{item.gun_oruntu_adi||''}}</div>
+                        <td class="text-muted" style="font-size:0.8rem;">
+                            ${{formatCurrency(item.menzil_asagi, item.birim)}}-${{formatCurrency(item.menzil_yukari, item.birim)}}
                         </td>
                         <td style="text-align:center;"><strong>${{item.skor}}</strong></td>
-                        <td style="max-width:160px; white-space: normal; line-height:1.5;">${{signalBadges || '–'}}</td>
                         <td>${{durumBadge}}</td>
                         <td>
                             <a href="${{item.tv_link}}" target="_blank" class="btn-tv">
@@ -2354,49 +1637,27 @@ def piyasa_tara():
                     sinyal_key = f"{item['piyasa_id']}_{item['symbol']}_{bugun_str}"
                     if sinyal_key not in gonderilen_sinyaller:
                         try:
-                            sinyal_liste = []
-                            if item.get("ema_crossover_yukari"): sinyal_liste.append("✂️ EMA Crossover")
-                            if item.get("rsi_uyumsuzlugu"): sinyal_liste.append("🔄 RSI Divergence")
-                            if item.get("bollinger_kirilis"): sinyal_liste.append("💥 Bollinger Kırılış")
-                            if item.get("sikisma"): sinyal_liste.append("🌀 Sıkışma")
-                            if item.get("birikim_raw"): sinyal_liste.append("📥 OBV Birikim")
-                            if item.get("patlama_adayi"): sinyal_liste.append("🚀 Patlama Adayı")
-                            if item.get("mum_bullish"): sinyal_liste.append(f"🕯️ {item.get('mum_adi','Formasyon')}")
-                            if item.get("hacim_guc_pozitif"): sinyal_liste.append(f"📊 Hacim Güç:{item.get('hacim_guc_orani',1):.1f}x")
-                            sinyal_metin = " | ".join(sinyal_liste) if sinyal_liste else "Yok"
-
-                            # Sinyal türü: Günlük mi Haftalık mı?
-                            is_gunluk = item.get("ema_crossover_yukari") or item.get("patlama_adayi") or (item.get("hacim_yuksek") and item.get("mum_bullish"))
-                            is_haftalik = item.get("trend_yukselis") and item.get("haftalik_yukselis") and item.get("birikim_raw")
-                            if is_gunluk and is_haftalik:
-                                tur_metin = "📅 Günlük + 📆 Haftalık"
-                            elif is_gunluk:
-                                tur_metin = "📅 Günlük Sinyal"
-                            elif is_haftalik:
-                                tur_metin = "📆 Haftalık Swing"
-                            else:
-                                tur_metin = "📊 Genel Sinyal"
+                            erken_liste = []
+                            if item.get("sikisma"): erken_liste.append("Sıkışma(🌀)")
+                            if item.get("hacim_kurumus"): erken_liste.append("Hacim kuruması")
+                            if item.get("birikim_raw"): erken_liste.append("OBV birikim(📥)")
+                            if item.get("patlama_adayi"): erken_liste.append("Patlama Potansiyeli(🚀)")
+                            erken_metin = ", ".join(erken_liste) if erken_liste else "Yok"
 
                             piyasa_durum_metni = "⚠️ <b>(Piyasa Kapalı - Hafta Sonu Sinyali)</b>\n" if not item["acik_mi"] else ""
-                            guven = item.get('guven_yuzde', 0)
-                            guven_bar = "🟢" * (guven // 20) + "⬜" * (5 - guven // 20)
 
                             mesaj = (
-                                f"🛡️ <b>{item['symbol']} — GARANTİ AL SİNYALİ</b>\n"
+                                f"🛡️ <b>{item['symbol']} - GARANTİ AL SİNYALİ</b>\n"
                                 f"{piyasa_durum_metni}"
-                                f"🏷️ <b>Tür:</b> {tur_metin}\n"
-                                f"🌍 <b>Piyasa:</b> {item['piyasa_id']} | 💹 <b>Güven:</b> {guven_bar} {guven}%\n"
-                                f"💰 <b>Fiyat:</b> {deger_formatla(item['fiyat'])}{item['birim']} | RSI:{item['rsi']:.0f} | ADX:{item['adx']:.0f} | Skor:{item['skor']}\n"
-                                f"📈 <b>Trend:</b> {'✅ Yükseliş' if item['trend_yukselis'] else '❓ Belirsiz'} | <b>Haftalık:</b> {'✅ Yükseliş' if item.get('haftalik_yukselis') else '⚠️ Zayıf'}\n"
-                                f"📡 <b>Sinyaller:</b> {sinyal_metin}\n"
-                                f"─────────────────\n"
-                                f"📌 <b>Alım Aralığı:</b> {deger_formatla(item['alim_min'])} – {deger_formatla(item['alim_max'])} <i>({item['alim_durum']})</i>\n"
-                                f"🛑 <b>Stop-Loss:</b> {deger_formatla(item['stop'])}{item['birim']}\n"
-                                f"🎯 <b>Hedef-1:</b> {deger_formatla(item['kar_hedef_1'])}{item['birim']} (+{item['beklenen_kar_yuzde_1']:.0f}%)\n"
-                                f"🚀 <b>Hedef-2 (Fib):</b> {deger_formatla(item['kar_hedef_2'])}{item['birim']} (+{item.get('beklenen_kar_yuzde_2', 0):.0f}%)\n"
-                                f"⚖️ <b>R/O Oranı:</b> {item['ro_1']} / {item['ro_2']}\n"
-                                f"─────────────────\n"
-                                f"⚠️ <i>Yatırım tavsiyesi değildir.</i>"
+                                f"🌍 <b>Piyasa:</b> {item['piyasa_id']}\n"
+                                f"💰 {deger_formatla(item['fiyat'])}{item['birim']} | RSI:{item['rsi']:.0f} | Skor:{item['skor']}\n"
+                                f"📈 Trend: {'Yükseliş' if item['trend_yukselis'] else 'Belirsiz'} | Yön: {item['yon_bias']}\n"
+                                f"🔎 Erken Sinyaller: {erken_metin}\n"
+                                f"📌 Alım Aralığı: {deger_formatla(item['alim_min'])} - {deger_formatla(item['alim_max'])} ({item['alim_durum']})\n"
+                                f"🛑 Stop: {deger_formatla(item['stop'])} | 🎯 Hedef-1: {deger_formatla(item['kar_hedef_1'])} | 🚀 Hedef-2: {deger_formatla(item['kar_hedef_2'])}\n"
+                                f"⚖️ Risk/Ödül: {item['ro_1']} / {item['ro_2']} | 🎯 Beklenen Kâr: +{item['beklenen_kar_yuzde_1']:.0f}% / +{item['beklenen_kar_yuzde_2']:.0f}%\n"
+                                f"↕️ Olası Menzil: {deger_formatla(item['menzil_asagi'])} - {deger_formatla(item['menzil_yukari'])}\n"
+                                f"⚠️ Yatırım tavsiyesi değildir."
                             )
                             bildirim_gonder(mesaj)
                             gonderilen_sinyaller.add(sinyal_key)
@@ -2432,54 +1693,6 @@ def piyasa_tara():
         
         print(Fore.GREEN + f"[+] Web Gösterge Paneli başarıyla güncellendi: {DASHBOARD_DOSYASI}" + Style.RESET_ALL)
 
-        # =========================================================
-        # AKSAM BİLDİRİMİ — Yarın İçin En İyi Setups (Piyasa kapandıktan sonra)
-        # =========================================================
-        try:
-            simdi_ist = datetime.now(ISTANBUL_TZ)
-            # TR piyasası 18:15'ten sonra veya US piyasası 23:00'dan sonra (TR saatiyle)
-            aksam_mi = simdi_ist.hour >= 18
-            if aksam_mi:
-                # Tüm sonuçlardan ertesi gün skoru en yüksek 5 hisseyi seç
-                yarin_adaylari = sorted(
-                    [r for r in tum_sinyaller_listesi if r.get("ertesi_gun_skoru", 0) >= 60],
-                    key=lambda x: x.get("ertesi_gun_skoru", 0),
-                    reverse=True
-                )[:5]
-
-                if yarin_adaylari:
-                    aksam_key = f"AKSAM_BILDIRIMI_{simdi_ist.strftime('%Y%m%d')}"
-                    if aksam_key not in gonderilen_sinyaller:
-                        satirlar = ""
-                        for i, r in enumerate(yarin_adaylari, 1):
-                            eg = r.get('ertesi_gun_skoru', 0)
-                            yoru = r.get('acilis_yonu', '→')
-                            kg   = r.get('kapanis_gucu_pct', 50)
-                            ort  = r.get('gun_oruntu_adi', '')
-                            satirlar += (
-                                f"  {i}. <b>{r['symbol']}</b> ({r['piyasa_id']}) — "
-                                f"Skor: <b>{eg}/100</b> | {yoru}\n"
-                                f"     Kapanış Gücü: {kg:.0f}% | {ort}\n"
-                                f"     Alım: {deger_formatla(r['alim_min'])}-{deger_formatla(r['alim_max'])}{r['birim']} | "
-                                f"Stop: {deger_formatla(r['stop'])}{r['birim']} | "
-                                f"H2: {deger_formatla(r['kar_hedef_2'])}{r['birim']}\n\n"
-                            )
-                        aksam_mesaj = (
-                            f"🌙 <b>AKSAM TARАМASI — YARIN İÇİN ÖNERİLER</b>\n"
-                            f"📅 {simdi_ist.strftime('%d.%m.%Y')} akşamı | Ertesi Gün Skoru'na Göre\n"
-                            f"─────────────────────\n"
-                            f"{satirlar}"
-                            f"─────────────────────\n"
-                            f"⚠️ <i>İstatistiksel tahmindir. Yatırım tavsiyesi değildir.</i>"
-                        )
-                        bildirim_gonder(aksam_mesaj)
-                        gonderilen_sinyaller.add(aksam_key)
-                        sinyalleri_kaydet(gonderilen_sinyaller)
-                        print(Fore.MAGENTA + f"[🌙] Akşam bildirimi gönderildi ({len(yarin_adaylari)} aday)" + Style.RESET_ALL)
-        except Exception as e:
-            if VERBOSE:
-                print(f"Akşam bildirimi hatası: {e}")
-
     except Exception as e:
         hata_mesaji = traceback.format_exc()
         hata_kaydet(hata_mesaji)
@@ -2488,34 +1701,31 @@ def piyasa_tara():
         raise
 
 # === ANA PROGRAM BAŞLANGICI ===
-print("=" * 70)
-print("BORSA TARAMA ROBOTU v9 — ERTESİ GÜN ANALİZİ BAŞLIYOR")
-print("SÜRÜM: v9.0 (EMA Cross | RSI Div | Kapanış Gücü | Ertesi Gün Skoru | Akşam Bildirimi)")
-print("=" * 70)
+print("=" * 50)
+print("BORSA TARAMA ROBOTU BAŞLIYOR (Concurrency + Dashboard)")
+print("SÜRÜM: v7.5 (paralel tarama & interaktif web paneli)")
+print("=" * 50)
 
 try:
     print("İlk tarama yapılıyor...")
     piyasa_tara()
 
-    if not os.getenv("GITHUB_ACTIONS"):
-        while True:
-            try:
-                print(Fore.LIGHTBLUE_EX + f"\n[{datetime.now(ISTANBUL_TZ).strftime('%H:%M:%S')}] Sonraki tarama: {TARAMA_ARALIGI} dakika sonra..." + Style.RESET_ALL)
-                print(Fore.YELLOW + "Kapatmak için Ctrl+C basın" + Style.RESET_ALL)
-                time.sleep(TARAMA_ARALIGI * 60)
-                # Yapılandırmayı ve sembolleri her döngüde yeniden yükle (config.json güncellenmiş olabilir)
-                PIYASALAR, VERBOSE, TARAMA_ARALIGI = config_yukle()
-                piyasa_tara()
-            except KeyboardInterrupt:
-                print("\nKullanıcı tarafından durduruldu.")
-                break
-            except Exception as e:
-                hata_kaydet(traceback.format_exc())
-                print(Fore.RED + f"\n[!] Döngü hatası: {e}" + Style.RESET_ALL)
-                print(Fore.YELLOW + "15 saniye sonra tekrar deneniyor..." + Style.RESET_ALL)
-                time.sleep(15)
-    else:
-        print(Fore.GREEN + "\n[+] GitHub Actions ortamı algılandı. Tarama başarıyla tamamlandı ve sonlandırılıyor." + Style.RESET_ALL)
+    while True:
+        try:
+            print(Fore.LIGHTBLUE_EX + f"\n[{datetime.now(ISTANBUL_TZ).strftime('%H:%M:%S')}] Sonraki tarama: {TARAMA_ARALIGI} dakika sonra..." + Style.RESET_ALL)
+            print(Fore.YELLOW + "Kapatmak için Ctrl+C basın" + Style.RESET_ALL)
+            time.sleep(TARAMA_ARALIGI * 60)
+            # Yapılandırmayı ve sembolleri her döngüde yeniden yükle (config.json güncellenmiş olabilir)
+            PIYASALAR, VERBOSE, TARAMA_ARALIGI = config_yukle()
+            piyasa_tara()
+        except KeyboardInterrupt:
+            print("\nKullanıcı tarafından durduruldu.")
+            break
+        except Exception as e:
+            hata_kaydet(traceback.format_exc())
+            print(Fore.RED + f"\n[!] Döngü hatası: {e}" + Style.RESET_ALL)
+            print(Fore.YELLOW + "15 saniye sonra tekrar deneniyor..." + Style.RESET_ALL)
+            time.sleep(15)
 
 except KeyboardInterrupt:
     print("\nProgram kapatıldı.")
@@ -2525,9 +1735,5 @@ except Exception as e:
     print(Fore.YELLOW + f"Hata:\n{traceback.format_exc()}" + Style.RESET_ALL)
 finally:
     print("\n" + "=" * 50)
-    if not os.getenv("GITHUB_ACTIONS"):
-        # Yalnızca lokal çalışmada kullanıcıdan giriş bekle
-        print("Kapatmak için Enter tuşuna basın...")
-        guvenli_giris_bekle()
-    else:
-        print("GitHub Actions: Program tamamlandı.")
+    print("Kapatmak için Enter tuşuna basın...")
+    input()
