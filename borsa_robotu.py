@@ -1710,30 +1710,54 @@ try:
     print("İlk tarama yapılıyor...")
     piyasa_tara()
 
-    while True:
-        try:
-            print(Fore.LIGHTBLUE_EX + f"\n[{datetime.now(ISTANBUL_TZ).strftime('%H:%M:%S')}] Sonraki tarama: {TARAMA_ARALIGI} dakika sonra..." + Style.RESET_ALL)
-            print(Fore.YELLOW + "Kapatmak için Ctrl+C basın" + Style.RESET_ALL)
-            time.sleep(TARAMA_ARALIGI * 60)
-            # Yapılandırmayı ve sembolleri her döngüde yeniden yükle (config.json güncellenmiş olabilir)
-            PIYASALAR, VERBOSE, TARAMA_ARALIGI = config_yukle()
-            piyasa_tara()
-        except KeyboardInterrupt:
-            print("\nKullanıcı tarafından durduruldu.")
-            break
-        except Exception as e:
-            hata_kaydet(traceback.format_exc())
-            print(Fore.RED + f"\n[!] Döngü hatası: {e}" + Style.RESET_ALL)
-            print(Fore.YELLOW + "15 saniye sonra tekrar deneniyor..." + Style.RESET_ALL)
-            time.sleep(15)
+    # GitHub Actions ortamında TEK tarama yap ve çık
+    if os.getenv("GITHUB_ACTIONS"):
+        print(Fore.GREEN + "\n[+] GitHub Actions ortamı algılandı. Tarama tamamlandı." + Style.RESET_ALL)
+
+    else:
+        while True:
+            try:
+                print(
+                    Fore.LIGHTBLUE_EX
+                    + f"\n[{datetime.now(ISTANBUL_TZ).strftime('%H:%M:%S')}] Sonraki tarama: {TARAMA_ARALIGI} dakika sonra..."
+                    + Style.RESET_ALL
+                )
+
+                print(
+                    Fore.YELLOW
+                    + "Kapatmak için Ctrl+C basın"
+                    + Style.RESET_ALL
+                )
+
+                time.sleep(TARAMA_ARALIGI * 60)
+
+                PIYASALAR, VERBOSE, TARAMA_ARALIGI = config_yukle()
+
+                piyasa_tara()
+
+            except KeyboardInterrupt:
+                print("\nKullanıcı tarafından durduruldu.")
+                break
+
+            except Exception as e:
+                hata_kaydet(traceback.format_exc())
+                print(Fore.RED + f"\n[!] Döngü hatası: {e}" + Style.RESET_ALL)
+                print(Fore.YELLOW + "15 saniye sonra tekrar deneniyor..." + Style.RESET_ALL)
+                time.sleep(15)
 
 except KeyboardInterrupt:
     print("\nProgram kapatıldı.")
+
 except Exception as e:
     hata_kaydet(traceback.format_exc())
     print(Fore.RED + f"\n❌ Program durdu: {e}" + Style.RESET_ALL)
     print(Fore.YELLOW + f"Hata:\n{traceback.format_exc()}" + Style.RESET_ALL)
+
 finally:
     print("\n" + "=" * 50)
-    print("Kapatmak için Enter tuşuna basın...")
-    input()
+
+    if not os.getenv("GITHUB_ACTIONS"):
+        print("Kapatmak için Enter tuşuna basın...")
+        input()
+    else:
+        print("GitHub Actions çalışması başarıyla tamamlandı.")
