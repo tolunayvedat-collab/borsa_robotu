@@ -1,7 +1,0 @@
-pandas
-yfinance
-requests
-prettytable
-colorama
-python-dotenv
-tzdata
