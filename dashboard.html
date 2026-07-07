@@ -1,4 +1,694 @@
-<!DOCTYPE html>
+import sys
+import os
+
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except Exception:
+    pass
+
+import time
+import json
+import traceback
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# --- KÜTÜPHANE KONTROLÜ ---
+try:
+    import pandas as pd
+    import yfinance as yf
+    import requests
+    from zoneinfo import ZoneInfo
+    from prettytable import PrettyTable
+    from colorama import Fore, Back, Style, init
+    from dotenv import load_dotenv
+except ImportError as e:
+    print("=" * 60)
+    print("❌ EKSİK KÜTÜPHANE HATASI")
+    print("=" * 60)
+    print(f"\nHata: {e}\n")
+    print("Aşağıdaki komutu çalıştırıp gerekli kütüphaneleri kur:\n")
+    print("  pip install pandas yfinance requests prettytable colorama python-dotenv tzdata\n")
+    print("=" * 60)
+    input("Kapatmak için Enter tuşuna basın...")
+    sys.exit(1)
+
+# --- SAAT DİLİMİ KONTROLÜ ---
+try:
+    ISTANBUL_TZ = ZoneInfo("Europe/Istanbul")
+    NEWYORK_TZ = ZoneInfo("America/New_York")
+except Exception as e:
+    print("=" * 60)
+    print("❌ SAAT DİLİMİ (tzdata) HATASI")
+    print("=" * 60)
+    print(f"\nHata: {e}\n")
+    print("Windows'ta saat dilimi veritabanı eksik olabilir. Şu komutu çalıştır:\n")
+    print("  pip install tzdata\n")
+    print("Kurulumdan sonra programı tekrar başlat.")
+    print("=" * 60)
+    input("Kapatmak için Enter tuşuna basın...")
+    sys.exit(1)
+
+# --- ORTAM DEĞİŞKENLERİ (.env dosyasından okunur) ---
+load_dotenv()
+
+# --- HATA LOG VE DOSYALAR ---
+LOG_DOSYASI = "hata_log.txt"
+SINYAL_KAYIT_DOSYASI = "gonderilen_sinyaller.json"
+CONFIG_DOSYASI = "config.json"
+DASHBOARD_DOSYASI = "dashboard.html"
+
+# Varsayılan Değerler (Eğer config.json yüklenemezse kullanılır)
+VARSAYILAN_PIYASALAR = [
+    {
+        "id": "TR", "ad": "TR", "telegram_ad": "BIST",
+        "semboller": [
+            "THYAO.IS", "EREGL.IS", "AKBNK.IS", "ASELS.IS", "TUPRS.IS",
+            "SAHOL.IS", "BIMAS.IS", "YKBNK.IS", "KCHOL.IS", "ISCTR.IS",
+            "GARAN.IS", "SISE.IS", "PETKM.IS", "SASA.IS", "HEKTS.IS",
+            "ASTOR.IS", "KONTR.IS", "SMRTG.IS", "ALARK.IS", "ODAS.IS"
+        ]
+    },
+    {
+        "id": "US", "ad": "US", "telegram_ad": "ABD",
+        "semboller": [
+            "AAPL", "NVDA", "TSLA", "MSFT", "AMZN", "AMD", "META",
+            "GOOGL", "NFLX", "COIN", "INTC", "QCOM", "BABA", "XOM"
+        ]
+    },
+    {
+        "id": "KR", "ad": "KR", "telegram_ad": "KR",
+        "semboller": [
+            "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "XRP-USD",
+            "LINK-USD", "BNB-USD", "ADA-USD", "DOT-USD"
+        ]
+    }
+]
+
+# --- YAPILANDIRMA YÜKLEME ---
+def config_yukle():
+    yol = os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_DOSYASI)
+    if os.path.exists(yol):
+        try:
+            with open(yol, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                markets = cfg.get("markets", VARSAYILAN_PIYASALAR)
+                verbose = cfg.get("verbose", False)
+                interval = cfg.get("scan_interval_minutes", 15)
+                return markets, verbose, interval
+        except Exception as e:
+            print(f"Yapılandırma yüklenirken hata oluştu: {e}. Varsayılan ayarlar kullanılacak.")
+    return VARSAYILAN_PIYASALAR, False, 15
+
+PIYASALAR, VERBOSE, TARAMA_ARALIGI = config_yukle()
+
+# --- HATA VE SİNYAL İŞLEMLERİ ---
+def hata_kaydet(hata_mesaji):
+    try:
+        yol = os.path.join(os.path.dirname(os.path.abspath(__file__)), LOG_DOSYASI)
+        with open(yol, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*50}\n")
+            f.write(f"Tarih: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Hata:\n{hata_mesaji}\n")
+            f.write(f"{'='*50}\n")
+    except Exception as e:
+        print(f"Log yazma hatası: {e}")
+
+# Colorama başlat
+try:
+    init(autoreset=True)
+except Exception as e:
+    print(f"Colorama hatası: {e}")
+    init()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    print(Fore.YELLOW + "[!] UYARI: TELEGRAM_TOKEN / TELEGRAM_CHAT_ID .env dosyasında bulunamadı. "
+                         "Telegram bildirimleri devre dışı kalacak." + Style.RESET_ALL)
+
+def _sinyal_dosya_yolu():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), SINYAL_KAYIT_DOSYASI)
+
+def sinyalleri_yukle():
+    try:
+        yol = _sinyal_dosya_yolu()
+        if os.path.exists(yol):
+            with open(yol, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+    except Exception as e:
+        if VERBOSE:
+            print(f"Sinyal kayıt okuma hatası: {e}")
+    return set()
+
+def sinyalleri_kaydet(sinyal_seti):
+    try:
+        yol = _sinyal_dosya_yolu()
+        with open(yol, "w", encoding="utf-8") as f:
+            json.dump(list(sinyal_seti), f)
+    except Exception as e:
+        if VERBOSE:
+            print(f"Sinyal kayıt yazma hatası: {e}")
+
+gonderilen_sinyaller = sinyalleri_yukle()
+
+def bildirim_gonder(mesaj):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": mesaj, "parse_mode": "HTML"}, timeout=3)
+    except Exception as e:
+        print(f"Telegram gönderim hatası: {e}")
+
+# --- TEKNİK ANALİZ İNDİKATÖRLERİ ---
+def rsi_hesapla(series, period=14):
+    try:
+        if len(series) < period + 1:
+            return pd.Series(50, index=series.index)
+        delta = series.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+
+        rsi = pd.Series(index=series.index, dtype=float)
+        rs = gain / loss.replace(0, pd.NA)
+        rsi = 100 - (100 / (1 + rs))
+        rsi = rsi.where(~((loss == 0) & (gain > 0)), 100)
+        rsi = rsi.where(~((loss == 0) & (gain == 0)), 50)
+        return rsi.fillna(50)
+    except Exception as e:
+        print(f"RSI hatası: {e}")
+        return pd.Series(50, index=series.index)
+
+def atr_hesapla(df, period=14):
+    try:
+        high = df['High']
+        low = df['Low']
+        prev_close = df['Close'].shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        return atr
+    except Exception as e:
+        print(f"ATR hatası: {e}")
+        return pd.Series(0, index=df.index)
+
+def bollinger_genislik_hesapla(df, period=20, std_carpani=2):
+    try:
+        orta = df['Close'].rolling(window=period).mean()
+        std = df['Close'].rolling(window=period).std()
+        ust = orta + std_carpani * std
+        alt = orta - std_carpani * std
+        genislik_yuzde = (ust - alt) / orta * 100
+        return genislik_yuzde
+    except Exception as e:
+        print(f"Bollinger hatası: {e}")
+        return pd.Series(999, index=df.index)
+
+def obv_hesapla(df):
+    try:
+        yon = df['Close'].diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+        obv = (yon * df['Volume']).fillna(0).cumsum()
+        return obv
+    except Exception as e:
+        print(f"OBV hatası: {e}")
+        return pd.Series(0, index=df.index)
+
+def dmi_adx_hesapla(df, period=14):
+    try:
+        high = df['High']
+        low = df['Low']
+        prev_high = high.shift(1)
+        prev_low = low.shift(1)
+        prev_close = df['Close'].shift(1)
+
+        artis_hareketi = high - prev_high
+        azalis_hareketi = prev_low - low
+
+        plus_dm = ((artis_hareketi > azalis_hareketi) & (artis_hareketi > 0)) * artis_hareketi
+        minus_dm = ((azalis_hareketi > artis_hareketi) & (azalis_hareketi > 0)) * azalis_hareketi
+
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+
+        tr_smooth = tr.rolling(window=period).mean()
+        plus_dm_smooth = plus_dm.rolling(window=period).mean()
+        minus_dm_smooth = minus_dm.rolling(window=period).mean()
+
+        di_plus = 100 * (plus_dm_smooth / tr_smooth.replace(0, pd.NA))
+        di_minus = 100 * (minus_dm_smooth / tr_smooth.replace(0, pd.NA))
+        
+        di_plus = di_plus.fillna(0)
+        di_minus = di_minus.fillna(0)
+        
+        sum_di = di_plus + di_minus
+        diff_di = (di_plus - di_minus).abs()
+        
+        dx = 100 * (diff_di / sum_di.replace(0, pd.NA))
+        dx = dx.fillna(0)
+        
+        adx = dx.rolling(window=period).mean().fillna(20)
+        return di_plus, di_minus, adx
+    except Exception as e:
+        print(f"DMI/ADX hatası: {e}")
+        return pd.Series(0, index=df.index), pd.Series(0, index=df.index), pd.Series(20, index=df.index)
+
+def macd_hesapla(series, fast_period=12, slow_period=26, signal_period=9):
+    try:
+        fast_ema = series.ewm(span=fast_period, adjust=False).mean()
+        slow_ema = series.ewm(span=slow_period, adjust=False).mean()
+        macd_line = fast_ema - slow_ema
+        signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
+        hist = macd_line - signal_line
+        return macd_line, signal_line, hist
+    except Exception as e:
+        print(f"MACD hatası: {e}")
+        return pd.Series(0, index=series.index), pd.Series(0, index=series.index), pd.Series(0, index=series.index)
+
+
+def veri_cek(ticker, period, interval, timeout=5):
+    try:
+        df = yf.Ticker(ticker).history(period=period, interval=interval, timeout=timeout)
+        if df is not None and not df.empty:
+            return df
+    except Exception as e:
+        if VERBOSE:
+            print(f"Veri çekme hatası [{ticker} {period} {interval}]: {e}")
+    return None
+
+
+def multi_timeframe_onay(df_4h, df_1h):
+    tf4h_ok = True
+    tf1h_ok = True
+
+    if df_4h is not None and len(df_4h) >= 30:
+        tf4h_close = df_4h['Close']
+        tf4h_ema50 = tf4h_close.ewm(span=50, adjust=False).mean().iloc[-1]
+        tf4h_macd_line, tf4h_signal, _ = macd_hesapla(tf4h_close, 12, 26, 9)
+        tf4h_ok = bool(tf4h_close.iloc[-1] > tf4h_ema50 and tf4h_macd_line.iloc[-1] > tf4h_signal.iloc[-1])
+
+    if df_1h is not None and len(df_1h) >= 40:
+        tf1h_close = df_1h['Close']
+        tf1h_ema21 = tf1h_close.ewm(span=21, adjust=False).mean().iloc[-1]
+        tf1h_macd_line, tf1h_signal, _ = macd_hesapla(tf1h_close, 12, 26, 9)
+        tf1h_ok = bool(tf1h_close.iloc[-1] > tf1h_ema21 and tf1h_macd_line.iloc[-1] > tf1h_signal.iloc[-1])
+
+    return tf4h_ok, tf1h_ok
+
+
+def ucgen_tipi_belirle(df, pencere=20):
+    try:
+        if len(df) < pencere * 2:
+            return "veri_yok"
+        alt = df['Low'].iloc[-pencere:]
+        ust = df['High'].iloc[-pencere:]
+        yarim = pencere // 2
+        ilk_alt = alt.iloc[:yarim].min()
+        son_alt = alt.iloc[yarim:].min()
+        ilk_ust = ust.iloc[:yarim].max()
+        son_ust = ust.iloc[yarim:].max()
+
+        dipler_yukseliyor = son_alt > ilk_alt * 1.005
+        tepeler_sabit_dusuk = son_ust <= ilk_ust * 1.005
+        tepeler_alcaliyor = son_ust < ilk_ust * 0.995
+        dipler_sabit_yuksek = son_alt >= ilk_alt * 0.995
+
+        if dipler_yukseliyor and tepeler_sabit_dusuk:
+            return "yukselen"
+        elif tepeler_alcaliyor and dipler_sabit_yuksek:
+            return "alcalan"
+        else:
+            return "notr"
+    except Exception as e:
+        print(f"Üçgen tipi hatası: {e}")
+        return "veri_yok"
+
+# --- DOVİZ KURLARI ---
+def guncel_dolar_kuru_al():
+    try:
+        kur_ticker = yf.Ticker("USDTRY=X")
+        kur_df = kur_ticker.history(period="2d", timeout=3)
+        if not kur_df.empty:
+            return kur_df['Close'].iloc[-1]
+    except Exception as e:
+        if VERBOSE:
+            print(f"Dolar kuru hatası: {e}")
+    return 46.80
+
+def guncel_euro_kuru_al():
+    try:
+        kur_ticker = yf.Ticker("EURTRY=X")
+        kur_df = kur_ticker.history(period="2d", timeout=3)
+        if not kur_df.empty:
+            return kur_df['Close'].iloc[-1]
+    except Exception as e:
+        if VERBOSE:
+            print(f"Euro kuru hatası: {e}")
+    return 50.50
+
+def deger_formatla(deger):
+    try:
+        if deger >= 1000000:
+            return f"{deger/1000000:.1f}M"
+        elif deger >= 1000:
+            return f"{deger:.0f}"
+        else:
+            return f"{deger:.1f}"
+    except:
+        return "0"
+
+def piyasa_acik_mi(piyasa_id):
+    try:
+        if piyasa_id == "KR":
+            return True
+
+        if piyasa_id == "TR":
+            simdi = datetime.now(ISTANBUL_TZ)
+            gun = simdi.weekday()
+            saat_dakika = simdi.strftime("%H:%M")
+            if gun in [5, 6]:
+                return False
+            return "10:00" <= saat_dakika <= "18:15"
+
+        if piyasa_id == "US":
+            simdi_ny = datetime.now(NEWYORK_TZ)
+            gun = simdi_ny.weekday()
+            saat_dakika = simdi_ny.strftime("%H:%M")
+            if gun in [5, 6]:
+                return False
+            return "09:30" <= saat_dakika <= "16:00"
+
+        return False
+    except Exception as e:
+        print(f"Piyasa kontrol hatası: {e}")
+        return False
+
+def tv_linki_olustur(symbol, piyasa_id):
+    if piyasa_id == "TR":
+        return f"https://tr.tradingview.com/symbols/BIST-{symbol}/"
+    elif piyasa_id == "US":
+        return f"https://tr.tradingview.com/symbols/{symbol}/"
+    elif piyasa_id == "KR":
+        base_crypto = symbol.replace("TRY", "").replace("USD", "")
+        return f"https://tr.tradingview.com/symbols/BINANCE-{base_crypto}USDT/"
+    return f"https://tr.tradingview.com/symbols/{symbol}/"
+
+# --- TEK TEK SEMBOL TARAMA FONKSİYONU (THREAD İÇİN) ---
+def sembol_tara(ticker, piyasa, usd_try, acik_mi):
+    try:
+        df = yf.Ticker(ticker).history(period="1y", interval="1d", timeout=5)
+        if df.empty or len(df) < 30:
+            return None
+
+        df4h = veri_cek(ticker, period="120d", interval="4h", timeout=5)
+        df1h = veri_cek(ticker, period="60d", interval="1h", timeout=5)
+        
+        yeterli_veri_var = len(df) >= 200
+
+        son_kapanis = df['Close'].iloc[-1]
+        onceki_kapanis = df['Close'].iloc[-2]
+        degisim = round(((son_kapanis - onceki_kapanis) / onceki_kapanis) * 100, 2)
+
+        df['RSI'] = rsi_hesapla(df['Close'], 14)
+        rsi_val = round(df['RSI'].iloc[-1], 2) if not pd.isna(df['RSI'].iloc[-1]) else 50
+
+        df['EMA21'] = df['Close'].ewm(span=21, adjust=False).mean()
+        ema21_val = df['EMA21'].iloc[-1]
+
+        trend_yukselis = None
+        if yeterli_veri_var:
+            ema50_val = df['Close'].ewm(span=50, adjust=False).mean().iloc[-1]
+            ema200_val = df['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
+            trend_yukselis = bool(ema50_val > ema200_val)
+
+        if len(df) >= 11:
+            roc10 = round(((son_kapanis - df['Close'].iloc[-11]) / df['Close'].iloc[-11]) * 100, 2)
+        else:
+            roc10 = 0.0
+
+        df['ATR'] = atr_hesapla(df, 14)
+        atr_val = df['ATR'].iloc[-1]
+        if pd.isna(atr_val) or atr_val <= 0:
+            atr_val = son_kapanis * 0.02
+
+        hacim_ort = df['Volume'].rolling(window=20).mean().iloc[-1]
+        hacim_yuksek = df['Volume'].iloc[-1] > hacim_ort * 1.2
+
+        # Bollinger sıkışma (squeeze)
+        sikisma = False
+        if len(df) >= 130:
+            genislik = bollinger_genislik_hesapla(df, 20, 2)
+            gecerli_genislik = genislik.dropna()
+            if len(gecerli_genislik) >= 120:
+                esik = gecerli_genislik.iloc[-120:].quantile(0.2)
+                sikisma = bool(genislik.iloc[-1] <= esik)
+
+        # Hacim kuruması
+        hacim_kurumus = False
+        if len(df) >= 25:
+            son5_hacim = df['Volume'].iloc[-6:-1].mean()
+            hacim_kurumus = bool(son5_hacim < hacim_ort * 0.7)
+
+        # OBV birikim/dağıtım
+        birikim = False
+        dagitim = False
+        if len(df) >= 15:
+            obv = obv_hesapla(df)
+            obv_degisim = obv.iloc[-1] - obv.iloc[-11]
+            fiyat_degisim_10 = abs((son_kapanis - df['Close'].iloc[-11]) / df['Close'].iloc[-11] * 100)
+            birikim = bool(obv_degisim > 0 and fiyat_degisim_10 < 3)
+            dagitim = bool(obv_degisim < 0 and fiyat_degisim_10 < 3)
+
+        # DI+/DI- (DMI) ve ADX (Trend Gücü)
+        di_plus, di_minus, adx = dmi_adx_hesapla(df, 14)
+        di_plus_val = di_plus.iloc[-1]
+        di_minus_val = di_minus.iloc[-1]
+        di_yukselis_baskin = bool(di_plus_val > di_minus_val)
+        adx_val = round(adx.iloc[-1], 2) if not pd.isna(adx.iloc[-1]) else 20.0
+
+        # MACD (Trend Momentum)
+        macd_line, signal_line, macd_hist = macd_hesapla(df['Close'], 12, 26, 9)
+        macd_val = round(macd_line.iloc[-1], 4) if not pd.isna(macd_line.iloc[-1]) else 0.0
+        macd_sig = round(signal_line.iloc[-1], 4) if not pd.isna(signal_line.iloc[-1]) else 0.0
+        macd_hist_val = round(macd_hist.iloc[-1], 4) if not pd.isna(macd_hist.iloc[-1]) else 0.0
+        macd_bullish = bool(macd_val > macd_sig)
+
+        tf4h_onay, tf1h_onay = multi_timeframe_onay(df4h, df1h)
+
+        # Göreceli Hacim (RVOL)
+        rvol = round(df['Volume'].iloc[-1] / hacim_ort, 2) if hacim_ort > 0 else 1.0
+        hacim_yuksek = bool(rvol >= 1.5)
+
+        # Sıkışma içi üçgen yapısı
+        ucgen_tip = ucgen_tipi_belirle(df, 20)
+
+        # Yön Eğilimi Skoru
+        yon_puan = 0
+        if di_yukselis_baskin: yon_puan += 1
+        else: yon_puan -= 1
+        if birikim: yon_puan += 1
+        if dagitim: yon_puan -= 1
+        if ucgen_tip == "yukselen": yon_puan += 1
+        elif ucgen_tip == "alcalan": yon_puan -= 1
+        if trend_yukselis is True: yon_puan += 1
+        elif trend_yukselis is False: yon_puan -= 1
+
+        if yon_puan >= 2:
+            yon_bias = "Yukarı"
+        elif yon_puan <= -2:
+            yon_bias = "Aşağı"
+        else:
+            yon_bias = "Nötr"
+
+        # Hareket aralığı
+        if len(df) >= 30:
+            menzil_genislik = df['High'].iloc[-30:].max() - df['Low'].iloc[-30:].min()
+        else:
+            menzil_genislik = atr_val * 5
+        menzil_yukari = son_kapanis + menzil_genislik
+        menzil_asagi = max(son_kapanis - menzil_genislik, son_kapanis * 0.5)
+
+        rsi_genel = (45 <= rsi_val <= 70)
+        ema_uygun = (son_kapanis > ema21_val)
+        rsi_garanti = (45 <= rsi_val <= 65)
+
+        # Patlama potansiyeli tespiti (Bollinger daralma + akıllı para girişi)
+        patlama_adayi = bool(sikisma and birikim)
+
+        # Alım Aralığı [Min - Max]
+        alim_min = ema21_val * 0.97
+        alim_max = ema21_val * 1.01
+        
+        # Alım Durumu
+        fark_yuzde = (son_kapanis - alim_max) / son_kapanis * 100
+        if son_kapanis <= alim_max:
+            alim_durum = "ŞİMDİ"
+        elif fark_yuzde <= 2.5:
+            alim_durum = "YAKIN"
+        else:
+            alim_durum = "BEKLE"
+
+        # Risk analizinde alım fiyatı olarak güncel kapanış fiyatı kullanılır
+        risk_buy_price = son_kapanis
+
+        # Stop-Loss: Giriş fiyatının 2.0 * ATR altı (Zararı %3-5 arasında sınırlar)
+        stop_val = son_kapanis - (atr_val * 2.0)
+        if stop_val <= 0:
+            stop_val = son_kapanis * 0.9
+
+        # Kâr Hedefi 1 (Kısmi Satış Hedefi: 1.5 * ATR üzeri)
+        kar_hedef_1 = son_kapanis + (atr_val * 1.5)
+
+        # Kâr Hedefi 2 (Ana Kırılım Hedefi: 3.0 * ATR üzeri)
+        kar_hedef_2 = son_kapanis + (atr_val * 3.0)
+
+        # Risk/Ödül Oranları (R/O)
+        risk = son_kapanis - stop_val
+        ro_1 = round((kar_hedef_1 - son_kapanis) / risk, 2) if risk > 0 else 0
+        ro_2 = round((kar_hedef_2 - son_kapanis) / risk, 2) if risk > 0 else 0
+
+        # Beklenen Kâr Yüzdeleri
+        beklenen_kar_yuzde_1 = round(((kar_hedef_1 - son_kapanis) / son_kapanis) * 100, 2) if son_kapanis > 0 else 0
+        beklenen_kar_yuzde_2 = round(((kar_hedef_2 - son_kapanis) / son_kapanis) * 100, 2) if son_kapanis > 0 else 0
+
+        # Gelişmiş Skorlama
+        skor = 10
+        if rsi_genel: skor += 10
+        if ema_uygun: skor += 15
+        if trend_yukselis: skor += 20
+        if macd_bullish: skor += 15
+        if adx_val >= 25: skor += 12
+        elif adx_val < 18: skor -= 10
+        if tf4h_onay: skor += 8
+        if tf1h_onay: skor += 8
+        if rvol >= 1.5: skor += 15
+        elif rvol >= 1.0: skor += 5
+        if roc10 > 0: skor += 5
+        if ro_2 >= 1.5: skor += 10
+        if sikisma: skor += 8
+        if hacim_kurumus: skor += 4
+        if birikim: skor += 8
+        if patlama_adayi: skor += 15
+        if yon_bias == "Yukarı": skor += 10
+        elif yon_bias == "Aşağı": skor -= 15
+
+        # Garanti Koşulları (Backtest Optimizasyonlu Güvenli Filtreler)
+        garanti = (
+            skor >= 85 and
+            ro_2 >= 1.5 and
+            rsi_garanti and
+            (trend_yukselis is True) and
+            macd_bullish and
+            (yon_bias == "Yukarı") and
+            (adx_val >= 25.0) and
+            tf4h_onay and
+            tf1h_onay
+        )
+
+        skor_goster = skor + 5 if (garanti and rsi_garanti) else skor
+        if ro_2 >= 2.5 and garanti:
+            skor_goster += 5
+
+        # Kripto birimini TL'ye çevir
+        if piyasa["id"] == "KR":
+            son_kapanis = son_kapanis * usd_try
+            ema21_val = ema21_val * usd_try
+            alim_min = alim_min * usd_try
+            alim_max = alim_max * usd_try
+            stop_val = stop_val * usd_try
+            kar_hedef_1 = kar_hedef_1 * usd_try
+            kar_hedef_2 = kar_hedef_2 * usd_try
+            menzil_yukari = menzil_yukari * usd_try
+            menzil_asagi = menzil_asagi * usd_try
+
+        fiyat_guncel = round(son_kapanis, 2)
+        gosterim_adi = ticker.replace(".IS", "").replace("-USD", "TRY")
+        birim = "₺" if piyasa["id"] in ["TR", "KR"] else "$"
+        tv_link = tv_linki_olustur(gosterim_adi, piyasa["id"])
+
+        if alim_max > stop_val and fiyat_guncel > stop_val:
+            return {
+                "symbol": gosterim_adi,
+                "fiyat": fiyat_guncel,
+                "birim": birim,
+                "degisim": degisim,
+                "rsi": rsi_val,
+                "skor": skor_goster,
+                "alim_min": round(alim_min, 2),
+                "alim_max": round(alim_max, 2),
+                "alim_durum": alim_durum,
+                "stop": round(stop_val, 2),
+                "kar_hedef_1": round(kar_hedef_1, 2),
+                "kar_hedef_2": round(kar_hedef_2, 2),
+                "ro_1": ro_1,
+                "ro_2": ro_2,
+                "beklenen_kar_yuzde_1": beklenen_kar_yuzde_1,
+                "beklenen_kar_yuzde_2": beklenen_kar_yuzde_2,
+                "trend_yukselis": trend_yukselis,
+                "sikisma": sikisma,
+                "hacim_kurumus": hacim_kurumus,
+                "birikim": birikim,
+                "birikim_raw": birikim,
+                "dagitim": dagitim,
+                "yon_bias": yon_bias,
+                "ucgen_tip": ucgen_tip,
+                "menzil_yukari": round(menzil_yukari, 2),
+                "menzil_asagi": round(menzil_asagi, 2),
+                "roc10": roc10,
+                "garanti": garanti,
+                "acik_mi": acik_mi,
+                "hacim_yuksek": hacim_yuksek,
+                "piyasa_id": piyasa["id"],
+                "tv_link": tv_link,
+                "patlama_adayi": patlama_adayi,
+                "adx": adx_val,
+                "macd_bullish": macd_bullish,
+                "macd_val": macd_val,
+                "macd_sig": macd_sig,
+                "macd_hist": macd_hist_val,
+                "rvol": rvol,
+                "tf4h_onay": tf4h_onay,
+                "tf1h_onay": tf1h_onay
+            }
+    except Exception as e:
+        if VERBOSE:
+            print(f"Hata ({ticker}): {str(e)[:50]}")
+    return None
+
+# --- JSON SERIALIZATION HELPER FOR NUMPY ---
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        try:
+            import numpy as np
+            if isinstance(obj, (np.integer, np.int64, np.int32)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64, np.float32)):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+        except ImportError:
+            pass
+        return super(NumpyEncoder, self).default(obj)
+
+# --- HTML/CSS DASHBOARD ÜRETİCİSİ ---
+def html_dashboard_olustur(gosterilecek_liste, tum_sonuclar, usd_try, eur_try):
+    try:
+        yol = os.path.join(os.path.dirname(os.path.abspath(__file__)), DASHBOARD_DOSYASI)
+        guncelleme_zamani = datetime.now(ISTANBUL_TZ).strftime("%d.%m.%Y %H:%M:%S")
+
+        # Javascript verisini JSON'a çevir
+        json_data = json.dumps(tum_sonuclar, cls=NumpyEncoder, ensure_ascii=False)
+
+        html_content = f"""<!DOCTYPE html>
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
@@ -6,7 +696,7 @@
     <title>Borsa ve Kripto Tarama Gösterge Paneli</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        :root {
+        :root {{
             --bg-main: #0b0f19;
             --bg-card: rgba(17, 24, 39, 0.75);
             --border-color: rgba(255, 255, 255, 0.08);
@@ -17,15 +707,15 @@
             --danger: #ef4444;
             --warning: #f59e0b;
             --info: #3b82f6;
-        }
+        }}
 
-        * {
+        * {{
             box-sizing: border-box;
             margin: 0;
             padding: 0;
-        }
+        }}
 
-        body {
+        body {{
             font-family: 'Inter', sans-serif;
             background-color: var(--bg-main);
             color: var(--text-main);
@@ -35,14 +725,14 @@
                 radial-gradient(circle at 10% 20%, rgba(16, 185, 129, 0.04) 0%, transparent 40%),
                 radial-gradient(circle at 90% 80%, rgba(59, 130, 246, 0.04) 0%, transparent 40%);
             background-attachment: fixed;
-        }
+        }}
 
-        .container {
+        .container {{
             max-width: 1500px;
             margin: 0 auto;
-        }
+        }}
 
-        header {
+        header {{
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -51,15 +741,15 @@
             padding-bottom: 1.5rem;
             flex-wrap: wrap;
             gap: 1rem;
-        }
+        }}
 
-        .logo-area {
+        .logo-area {{
             display: flex;
             align-items: center;
             gap: 0.75rem;
-        }
+        }}
 
-        .logo-icon {
+        .logo-icon {{
             background: linear-gradient(135deg, var(--primary), var(--info));
             width: 44px;
             height: 44px;
@@ -70,26 +760,26 @@
             font-weight: 700;
             font-size: 1.3rem;
             box-shadow: 0 4px 10px rgba(16, 185, 129, 0.3);
-        }
+        }}
 
-        .logo-title h1 {
+        .logo-title h1 {{
             font-size: 1.4rem;
             font-weight: 700;
             letter-spacing: -0.025em;
-        }
+        }}
 
-        .logo-title p {
+        .logo-title p {{
             font-size: 0.8rem;
             color: var(--text-muted);
-        }
+        }}
 
-        .stats-bar {
+        .stats-bar {{
             display: flex;
             gap: 1rem;
             flex-wrap: wrap;
-        }
+        }}
 
-        .stat-item {
+        .stat-item {{
             background: var(--bg-card);
             border: 1px solid var(--border-color);
             padding: 0.5rem 1rem;
@@ -99,14 +789,14 @@
             align-items: center;
             gap: 0.5rem;
             backdrop-filter: blur(8px);
-        }
+        }}
 
-        .stat-val {
+        .stat-val {{
             font-weight: 600;
             color: #fff;
-        }
+        }}
 
-        .live-dot {
+        .live-dot {{
             width: 8px;
             height: 8px;
             background-color: var(--primary);
@@ -114,23 +804,23 @@
             display: inline-block;
             box-shadow: 0 0 8px var(--primary);
             animation: pulse 1.5s infinite;
-        }
+        }}
 
-        @keyframes pulse {
-            0% { opacity: 0.5; }
-            50% { opacity: 1; }
-            100% { opacity: 0.5; }
-        }
+        @keyframes pulse {{
+            0% {{ opacity: 0.5; }}
+            50% {{ opacity: 1; }}
+            100% {{ opacity: 0.5; }}
+        }}
 
         /* Summary Cards Grid */
-        .cards-grid {
+        .cards-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
             gap: 1.25rem;
             margin-bottom: 2.5rem;
-        }
+        }}
 
-        .card {
+        .card {{
             background: var(--bg-card);
             border: 1px solid var(--border-color);
             border-radius: 12px;
@@ -138,14 +828,14 @@
             backdrop-filter: blur(8px);
             box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
             transition: transform 0.2s, border-color 0.2s;
-        }
+        }}
 
-        .card:hover {
+        .card:hover {{
             transform: translateY(-2px);
             border-color: rgba(255, 255, 255, 0.12);
-        }
+        }}
 
-        .card-header {
+        .card-header {{
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -154,39 +844,39 @@
             font-size: 0.8rem;
             text-transform: uppercase;
             letter-spacing: 0.05em;
-        }
+        }}
 
-        .card-value {
+        .card-value {{
             font-size: 1.8rem;
             font-weight: 700;
             color: #fff;
             margin-bottom: 0.25rem;
-        }
+        }}
 
-        .card-desc {
+        .card-desc {{
             font-size: 0.8rem;
             color: var(--text-muted);
-        }
+        }}
 
         /* Controls Section */
-        .controls {
+        .controls {{
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 1.5rem;
             gap: 1rem;
             flex-wrap: wrap;
-        }
+        }}
 
-        .tabs {
+        .tabs {{
             display: flex;
             background: var(--bg-card);
             padding: 4px;
             border-radius: 8px;
             border: 1px solid var(--border-color);
-        }
+        }}
 
-        .tab-btn {
+        .tab-btn {{
             background: transparent;
             border: none;
             color: var(--text-muted);
@@ -196,20 +886,20 @@
             font-size: 0.85rem;
             font-weight: 500;
             transition: all 0.2s;
-        }
+        }}
 
-        .tab-btn.active {
+        .tab-btn.active {{
             background: rgba(255, 255, 255, 0.08);
             color: #fff;
-        }
+        }}
 
-        .search-container {
+        .search-container {{
             position: relative;
             flex-grow: 1;
             max-width: 320px;
-        }
+        }}
 
-        .search-input {
+        .search-input {{
             width: 100%;
             background: var(--bg-card);
             border: 1px solid var(--border-color);
@@ -219,28 +909,28 @@
             font-size: 0.85rem;
             outline: none;
             transition: border-color 0.2s;
-        }
+        }}
 
-        .search-input:focus {
+        .search-input:focus {{
             border-color: var(--primary);
-        }
+        }}
 
-        .search-icon {
+        .search-icon {{
             position: absolute;
             left: 0.8rem;
             top: 50%;
             transform: translateY(-50%);
             color: var(--text-muted);
             pointer-events: none;
-        }
+        }}
 
-        .quick-filters {
+        .quick-filters {{
             display: flex;
             gap: 0.5rem;
             flex-wrap: wrap;
-        }
+        }}
 
-        .filter-chip {
+        .filter-chip {{
             background: var(--bg-card);
             border: 1px solid var(--border-color);
             padding: 0.4rem 0.75rem;
@@ -252,37 +942,37 @@
             align-items: center;
             gap: 0.35rem;
             color: var(--text-muted);
-        }
+        }}
 
-        .filter-chip:hover {
+        .filter-chip:hover {{
             border-color: rgba(255, 255, 255, 0.15);
             color: var(--text-main);
-        }
+        }}
 
-        .filter-chip.active {
+        .filter-chip.active {{
             background: rgba(16, 185, 129, 0.12);
             border-color: var(--primary);
             color: var(--primary);
-        }
+        }}
 
         /* Table Design */
-        .table-container {
+        .table-container {{
             background: var(--bg-card);
             border: 1px solid var(--border-color);
             border-radius: 12px;
             overflow-x: auto;
             backdrop-filter: blur(8px);
             margin-bottom: 2rem;
-        }
+        }}
 
-        table {
+        table {{
             width: 100%;
             border-collapse: collapse;
             text-align: left;
             font-size: 0.85rem;
-        }
+        }}
 
-        th {
+        th {{
             background: rgba(10, 15, 30, 0.5);
             font-weight: 600;
             color: var(--text-muted);
@@ -294,28 +984,28 @@
             cursor: pointer;
             user-select: none;
             transition: color 0.2s;
-        }
+        }}
 
-        th:hover {
+        th:hover {{
             color: #fff;
-        }
+        }}
 
-        td {
+        td {{
             padding: 0.9rem 1rem;
             border-bottom: 1px solid var(--border-color);
             vertical-align: middle;
-        }
+        }}
 
-        tr:last-child td {
+        tr:last-child td {{
             border-bottom: none;
-        }
+        }}
 
-        tr:hover td {
+        tr:hover td {{
             background: rgba(255, 255, 255, 0.015);
-        }
+        }}
 
         /* Badge Designs */
-        .badge {
+        .badge {{
             display: inline-flex;
             align-items: center;
             justify-content: center;
@@ -324,55 +1014,55 @@
             font-size: 0.7rem;
             font-weight: 700;
             letter-spacing: 0.02em;
-        }
+        }}
 
-        .badge-now { background: rgba(16, 185, 129, 0.12); color: var(--primary); }
-        .badge-near { background: rgba(245, 158, 11, 0.12); color: var(--warning); }
-        .badge-wait { background: rgba(239, 68, 68, 0.12); color: var(--danger); }
-        .badge-izl { background: rgba(59, 130, 246, 0.12); color: var(--info); }
-        .badge-garanti {
+        .badge-now {{ background: rgba(16, 185, 129, 0.12); color: var(--primary); }}
+        .badge-near {{ background: rgba(245, 158, 11, 0.12); color: var(--warning); }}
+        .badge-wait {{ background: rgba(239, 68, 68, 0.12); color: var(--danger); }}
+        .badge-izl {{ background: rgba(59, 130, 246, 0.12); color: var(--info); }}
+        .badge-garanti {{
             background: linear-gradient(135deg, var(--primary), var(--info));
             color: #fff;
             box-shadow: 0 2px 5px rgba(0,0,0,0.15);
-        }
+        }}
 
-        .market-dot {
+        .market-dot {{
             width: 7px;
             height: 7px;
             border-radius: 50%;
             display: inline-block;
-        }
-        .market-open {
+        }}
+        .market-open {{
             background-color: var(--primary);
             box-shadow: 0 0 6px var(--primary);
-        }
-        .market-closed {
+        }}
+        .market-closed {{
             background-color: var(--danger);
-        }
+        }}
 
-        .text-green { color: var(--primary) !important; }
-        .text-red { color: var(--danger) !important; }
-        .text-yellow { color: var(--warning) !important; }
-        .text-muted { color: var(--text-muted) !important; }
+        .text-green {{ color: var(--primary) !important; }}
+        .text-red {{ color: var(--danger) !important; }}
+        .text-yellow {{ color: var(--warning) !important; }}
+        .text-muted {{ color: var(--text-muted) !important; }}
 
-        .symbol-cell {
+        .symbol-cell {{
             display: flex;
             align-items: center;
             gap: 0.35rem;
             font-weight: 600;
             color: #fff;
-        }
+        }}
 
-        .icon-badges {
+        .icon-badges {{
             display: flex;
             gap: 2px;
-        }
+        }}
 
-        .icon-badge {
+        .icon-badge {{
             font-size: 0.8rem;
-        }
+        }}
 
-        .btn-tv {
+        .btn-tv {{
             background: rgba(255, 255, 255, 0.03);
             border: 1px solid var(--border-color);
             color: var(--text-main);
@@ -384,20 +1074,20 @@
             align-items: center;
             gap: 0.25rem;
             transition: all 0.2s;
-        }
+        }}
 
-        .btn-tv:hover {
+        .btn-tv:hover {{
             background: #fff;
             color: #000;
             border-color: #fff;
-        }
+        }}
 
-        .no-data {
+        .no-data {{
             text-align: center;
             padding: 4rem;
             color: var(--text-muted);
             font-size: 0.95rem;
-        }
+        }}
     </style>
 </head>
 <body>
@@ -414,15 +1104,15 @@
                 <div class="stat-item">
                     <span class="live-dot"></span>
                     <span>Son Güncelleme:</span>
-                    <span class="stat-val" id="last-update">07.07.2026 21:26:00</span>
+                    <span class="stat-val" id="last-update">{guncelleme_zamani}</span>
                 </div>
                 <div class="stat-item">
                     <span>Dolar:</span>
-                    <span class="stat-val">₺46.83</span>
+                    <span class="stat-val">₺{usd_try:.2f}</span>
                 </div>
                 <div class="stat-item">
                     <span>Euro:</span>
-                    <span class="stat-val">₺53.55</span>
+                    <span class="stat-val">₺{eur_try:.2f}</span>
                 </div>
             </div>
         </header>
@@ -468,6 +1158,14 @@
                 </div>
                 <div class="card-value text-blue" id="card-accumulation">0</div>
                 <div class="card-desc">Fiyat sabitken hacmi artan (OBV)</div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <span>TF Onayları</span>
+                    <span style="font-size:1.1rem">✅</span>
+                </div>
+                <div class="card-value text-green" id="card-tf-approval">0</div>
+                <div class="card-desc">4s + 1s onayı olan semboller</div>
             </div>
         </div>
 
@@ -525,6 +1223,8 @@
                         <th onclick="handleSort('ro_2')">R/O Oranı</th>
                         <th onclick="handleSort('beklenen_kar_yuzde_2')">Beklenen Kâr</th>
                         <th onclick="handleSort('menzil_yukari')">Olası Aralık</th>
+                        <th onclick="handleSort('tf4h_onay')">4s Onay</th>
+                        <th onclick="handleSort('tf1h_onay')">1s Onay</th>
                         <th onclick="handleSort('skor')">Skor</th>
                         <th>Durum</th>
                         <th>Grafik</th>
@@ -542,7 +1242,7 @@
 
     <script>
         // Python tarafından enjekte edilen veri
-        const dataset = [{"symbol": "ISCTR", "fiyat": 14.45, "birim": "₺", "degisim": 0.77, "rsi": 41.69, "skor": 50, "alim_min": 14.11, "alim_max": 14.69, "alim_durum": "ŞİMDİ", "stop": 13.63, "kar_hedef_1": 15.06, "kar_hedef_2": 15.68, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.25, "beklenen_kar_yuzde_2": 8.5, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 16.96, "menzil_asagi": 11.94, "roc10": -4.81, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-ISCTR/", "patlama_adayi": false, "adx": 33.38, "macd_bullish": false, "macd_val": 0.1243, "macd_sig": 0.2209, "macd_hist": -0.0966, "rvol": 0.88}, {"symbol": "EREGL", "fiyat": 41.26, "birim": "₺", "degisim": -0.63, "rsi": 61.37, "skor": 93, "alim_min": 39.02, "alim_max": 40.63, "alim_durum": "YAKIN", "stop": 38.93, "kar_hedef_1": 43.0, "kar_hedef_2": 44.75, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.23, "beklenen_kar_yuzde_2": 8.46, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 46.08, "menzil_asagi": 36.44, "roc10": 3.62, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-EREGL/", "patlama_adayi": false, "adx": 24.65, "macd_bullish": false, "macd_val": 0.7244, "macd_sig": 0.7742, "macd_hist": -0.0499, "rvol": 1.23}, {"symbol": "YKBNK", "fiyat": 37.6, "birim": "₺", "degisim": 0.37, "rsi": 34.75, "skor": 55, "alim_min": 37.98, "alim_max": 39.54, "alim_durum": "ŞİMDİ", "stop": 34.68, "kar_hedef_1": 39.79, "kar_hedef_2": 41.98, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.82, "beklenen_kar_yuzde_2": 11.64, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 48.84, "menzil_asagi": 26.36, "roc10": -12.31, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-YKBNK/", "patlama_adayi": false, "adx": 41.61, "macd_bullish": false, "macd_val": 0.4557, "macd_sig": 1.0412, "macd_hist": -0.5855, "rvol": 1.12}, {"symbol": "ASELS", "fiyat": 383.0, "birim": "₺", "degisim": -4.67, "rsi": 46.45, "skor": 93, "alim_min": 370.6, "alim_max": 385.89, "alim_durum": "ŞİMDİ", "stop": 343.89, "kar_hedef_1": 412.33, "kar_hedef_2": 441.66, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 7.66, "beklenen_kar_yuzde_2": 15.32, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 453.25, "menzil_asagi": 312.75, "roc10": -2.3, "garanti": false, "acik_mi": false, "hacim_yuksek": true, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-ASELS/", "patlama_adayi": false, "adx": 16.34, "macd_bullish": true, "macd_val": -0.7325, "macd_sig": -3.0259, "macd_hist": 2.2935, "rvol": 1.96}, {"symbol": "BIMAS", "fiyat": 374.25, "birim": "₺", "degisim": 0.88, "rsi": 44.25, "skor": 70, "alim_min": 361.79, "alim_max": 376.71, "alim_durum": "ŞİMDİ", "stop": 353.14, "kar_hedef_1": 390.08, "kar_hedef_2": 405.91, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.23, "beklenen_kar_yuzde_2": 8.46, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 418.25, "menzil_asagi": 330.25, "roc10": -2.22, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-BIMAS/", "patlama_adayi": false, "adx": 29.23, "macd_bullish": false, "macd_val": -3.3965, "macd_sig": -2.4334, "macd_hist": -0.9631, "rvol": 1.17}, {"symbol": "KCHOL", "fiyat": 189.2, "birim": "₺", "degisim": 0.64, "rsi": 41.19, "skor": 76, "alim_min": 187.08, "alim_max": 194.79, "alim_durum": "ŞİMDİ", "stop": 179.46, "kar_hedef_1": 196.51, "kar_hedef_2": 203.81, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.86, "beklenen_kar_yuzde_2": 7.72, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "yukselen", "menzil_yukari": 211.3, "menzil_asagi": 167.1, "roc10": -1.25, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-KCHOL/", "patlama_adayi": true, "adx": 17.95, "macd_bullish": false, "macd_val": -0.8714, "macd_sig": -0.312, "macd_hist": -0.5594, "rvol": 1.14}, {"symbol": "SAHOL", "fiyat": 92.8, "birim": "₺", "degisim": -0.85, "rsi": 29.77, "skor": 55, "alim_min": 93.38, "alim_max": 97.23, "alim_durum": "ŞİMDİ", "stop": 87.55, "kar_hedef_1": 96.74, "kar_hedef_2": 100.68, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.24, "beklenen_kar_yuzde_2": 8.49, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 107.3, "menzil_asagi": 78.3, "roc10": -6.4, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-SAHOL/", "patlama_adayi": false, "adx": 35.25, "macd_bullish": false, "macd_val": -0.0082, "macd_sig": 0.7631, "macd_hist": -0.7714, "rvol": 1.25}, {"symbol": "AKBNK", "fiyat": 73.6, "birim": "₺", "degisim": 0.14, "rsi": 35.81, "skor": 50, "alim_min": 72.91, "alim_max": 75.92, "alim_durum": "ŞİMDİ", "stop": 68.36, "kar_hedef_1": 77.53, "kar_hedef_2": 81.46, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.34, "beklenen_kar_yuzde_2": 10.69, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 93.2, "menzil_asagi": 54.0, "roc10": -8.57, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-AKBNK/", "patlama_adayi": false, "adx": 46.48, "macd_bullish": false, "macd_val": 1.0819, "macd_sig": 1.8415, "macd_hist": -0.7596, "rvol": 0.85}, {"symbol": "GARAN", "fiyat": 134.4, "birim": "₺", "degisim": 0.52, "rsi": 32.26, "skor": 30, "alim_min": 132.0, "alim_max": 137.44, "alim_durum": "ŞİMDİ", "stop": 127.57, "kar_hedef_1": 139.52, "kar_hedef_2": 144.64, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.81, "beklenen_kar_yuzde_2": 7.62, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 157.4, "menzil_asagi": 111.4, "roc10": -4.48, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-GARAN/", "patlama_adayi": false, "adx": 37.68, "macd_bullish": false, "macd_val": 0.8709, "macd_sig": 1.7898, "macd_hist": -0.9188, "rvol": 0.9}, {"symbol": "PETKM", "fiyat": 19.16, "birim": "₺", "degisim": 1.7, "rsi": 35.53, "skor": 53, "alim_min": 19.22, "alim_max": 20.01, "alim_durum": "ŞİMDİ", "stop": 18.03, "kar_hedef_1": 20.01, "kar_hedef_2": 20.86, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.44, "beklenen_kar_yuzde_2": 8.88, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 24.94, "menzil_asagi": 13.38, "roc10": -4.77, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-PETKM/", "patlama_adayi": false, "adx": 17.07, "macd_bullish": true, "macd_val": -0.7535, "macd_sig": -0.8026, "macd_hist": 0.0491, "rvol": 0.93}, {"symbol": "ODAS", "fiyat": 8.22, "birim": "₺", "degisim": 0.86, "rsi": 47.2, "skor": 64, "alim_min": 7.98, "alim_max": 8.31, "alim_durum": "ŞİMDİ", "stop": 7.23, "kar_hedef_1": 8.96, "kar_hedef_2": 9.7, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 9.02, "beklenen_kar_yuzde_2": 18.04, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": true, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 10.88, "menzil_asagi": 5.56, "roc10": -13.56, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-ODAS/", "patlama_adayi": false, "adx": 38.84, "macd_bullish": false, "macd_val": 0.1805, "macd_sig": 0.2755, "macd_hist": -0.095, "rvol": 0.48}, {"symbol": "KONTR", "fiyat": 4.09, "birim": "₺", "degisim": 9.95, "rsi": 21.58, "skor": 34, "alim_min": 4.62, "alim_max": 4.81, "alim_durum": "ŞİMDİ", "stop": 3.38, "kar_hedef_1": 4.62, "kar_hedef_2": 5.16, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 13.02, "beklenen_kar_yuzde_2": 26.04, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": true, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 9.16, "menzil_asagi": 2.05, "roc10": -9.11, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-KONTR/", "patlama_adayi": false, "adx": 70.27, "macd_bullish": true, "macd_val": -1.1036, "macd_sig": -1.1614, "macd_hist": 0.0578, "rvol": 0.21}, {"symbol": "SASA", "fiyat": 2.31, "birim": "₺", "degisim": -1.28, "rsi": 10.91, "skor": 20, "alim_min": 2.45, "alim_max": 2.55, "alim_durum": "ŞİMDİ", "stop": 2.16, "kar_hedef_1": 2.43, "kar_hedef_2": 2.54, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.01, "beklenen_kar_yuzde_2": 10.02, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 2.83, "menzil_asagi": 1.79, "roc10": -12.5, "garanti": false, "acik_mi": false, "hacim_yuksek": true, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-SASA/", "patlama_adayi": false, "adx": 24.84, "macd_bullish": false, "macd_val": -0.0977, "macd_sig": -0.0755, "macd_hist": -0.0222, "rvol": 5.99}, {"symbol": "ASTOR", "fiyat": 325.25, "birim": "₺", "degisim": 2.44, "rsi": 65.83, "skor": 110, "alim_min": 292.45, "alim_max": 304.51, "alim_durum": "BEKLE", "stop": 292.36, "kar_hedef_1": 349.92, "kar_hedef_2": 374.59, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 7.58, "beklenen_kar_yuzde_2": 15.17, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 448.5, "menzil_asagi": 202.0, "roc10": 9.88, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-ASTOR/", "patlama_adayi": false, "adx": 29.26, "macd_bullish": true, "macd_val": 2.4303, "macd_sig": -0.9396, "macd_hist": 3.3699, "rvol": 1.23}, {"symbol": "HEKTS", "fiyat": 3.12, "birim": "₺", "degisim": -1.58, "rsi": 26.28, "skor": 50, "alim_min": 3.45, "alim_max": 3.59, "alim_durum": "ŞİMDİ", "stop": 2.69, "kar_hedef_1": 3.44, "kar_hedef_2": 3.76, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 10.3, "beklenen_kar_yuzde_2": 20.6, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 4.6, "menzil_asagi": 1.64, "roc10": -21.8, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-HEKTS/", "patlama_adayi": false, "adx": 39.95, "macd_bullish": false, "macd_val": -0.2099, "macd_sig": -0.1451, "macd_hist": -0.0648, "rvol": 0.66}, {"symbol": "ALARK", "fiyat": 102.1, "birim": "₺", "degisim": -1.54, "rsi": 52.97, "skor": 90, "alim_min": 100.33, "alim_max": 104.47, "alim_durum": "ŞİMDİ", "stop": 95.7, "kar_hedef_1": 106.9, "kar_hedef_2": 111.7, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.7, "beklenen_kar_yuzde_2": 9.4, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": true, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "yukselen", "menzil_yukari": 119.25, "menzil_asagi": 84.95, "roc10": 2.1, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-ALARK/", "patlama_adayi": true, "adx": 17.94, "macd_bullish": false, "macd_val": 1.2172, "macd_sig": 1.5892, "macd_hist": -0.3719, "rvol": 0.68}, {"symbol": "SISE", "fiyat": 43.16, "birim": "₺", "degisim": -0.74, "rsi": 41.39, "skor": 35, "alim_min": 43.49, "alim_max": 45.28, "alim_durum": "ŞİMDİ", "stop": 40.5, "kar_hedef_1": 45.16, "kar_hedef_2": 47.15, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.62, "beklenen_kar_yuzde_2": 9.24, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "alcalan", "menzil_yukari": 48.36, "menzil_asagi": 37.96, "roc10": -4.39, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-SISE/", "patlama_adayi": false, "adx": 12.99, "macd_bullish": false, "macd_val": -0.5282, "macd_sig": -0.3507, "macd_hist": -0.1774, "rvol": 1.13}, {"symbol": "SMRTG", "fiyat": 11.0, "birim": "₺", "degisim": -2.05, "rsi": 28.04, "skor": 40, "alim_min": 11.31, "alim_max": 11.78, "alim_durum": "ŞİMDİ", "stop": 9.94, "kar_hedef_1": 11.8, "kar_hedef_2": 12.6, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 7.26, "beklenen_kar_yuzde_2": 14.51, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 13.49, "menzil_asagi": 8.51, "roc10": -12.0, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-SMRTG/", "patlama_adayi": false, "adx": 20.74, "macd_bullish": false, "macd_val": -0.0542, "macd_sig": 0.15, "macd_hist": -0.2042, "rvol": 0.67}, {"symbol": "PGSUS", "fiyat": 174.1, "birim": "₺", "degisim": -0.4, "rsi": 39.43, "skor": 20, "alim_min": 171.05, "alim_max": 178.11, "alim_durum": "ŞİMDİ", "stop": 165.89, "kar_hedef_1": 180.26, "kar_hedef_2": 186.42, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.54, "beklenen_kar_yuzde_2": 7.08, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Aşağı", "ucgen_tip": "yukselen", "menzil_yukari": 197.7, "menzil_asagi": 150.5, "roc10": -2.25, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-PGSUS/", "patlama_adayi": false, "adx": 30.39, "macd_bullish": false, "macd_val": -0.0736, "macd_sig": 0.4763, "macd_hist": -0.5499, "rvol": 1.35}, {"symbol": "GUBRF", "fiyat": 457.75, "birim": "₺", "degisim": -0.54, "rsi": 36.35, "skor": 50, "alim_min": 465.14, "alim_max": 484.33, "alim_durum": "ŞİMDİ", "stop": 416.64, "kar_hedef_1": 488.58, "kar_hedef_2": 519.41, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 6.74, "beklenen_kar_yuzde_2": 13.47, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 590.5, "menzil_asagi": 325.0, "roc10": -4.29, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-GUBRF/", "patlama_adayi": false, "adx": 30.48, "macd_bullish": false, "macd_val": -18.727, "macd_sig": -18.2098, "macd_hist": -0.5172, "rvol": 0.74}, {"symbol": "FROTO", "fiyat": 83.0, "birim": "₺", "degisim": 1.22, "rsi": 27.49, "skor": 15, "alim_min": 83.63, "alim_max": 87.08, "alim_durum": "ŞİMDİ", "stop": 79.21, "kar_hedef_1": 85.84, "kar_hedef_2": 88.69, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.43, "beklenen_kar_yuzde_2": 6.85, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 93.55, "menzil_asagi": 72.45, "roc10": -5.63, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-FROTO/", "patlama_adayi": false, "adx": 36.05, "macd_bullish": false, "macd_val": -1.8598, "macd_sig": -1.5115, "macd_hist": -0.3483, "rvol": 0.99}, {"symbol": "TOASO", "fiyat": 299.0, "birim": "₺", "degisim": -0.83, "rsi": 29.21, "skor": 40, "alim_min": 301.77, "alim_max": 314.22, "alim_durum": "ŞİMDİ", "stop": 273.46, "kar_hedef_1": 318.15, "kar_hedef_2": 337.3, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 6.41, "beklenen_kar_yuzde_2": 12.81, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 379.25, "menzil_asagi": 218.75, "roc10": -13.33, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-TOASO/", "patlama_adayi": false, "adx": 24.08, "macd_bullish": false, "macd_val": -0.1101, "macd_sig": 3.7924, "macd_hist": -3.9025, "rvol": 0.84}, {"symbol": "ARCLK", "fiyat": 98.8, "birim": "₺", "degisim": -0.8, "rsi": 34.0, "skor": 3, "alim_min": 98.79, "alim_max": 102.86, "alim_durum": "ŞİMDİ", "stop": 93.99, "kar_hedef_1": 102.41, "kar_hedef_2": 106.01, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.65, "beklenen_kar_yuzde_2": 7.3, "trend_yukselis": false, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 107.95, "menzil_asagi": 89.65, "roc10": -2.56, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-ARCLK/", "patlama_adayi": false, "adx": 17.49, "macd_bullish": false, "macd_val": -1.7949, "macd_sig": -1.7295, "macd_hist": -0.0654, "rvol": 0.63}, {"symbol": "VESTL", "fiyat": 24.44, "birim": "₺", "degisim": -0.24, "rsi": 48.44, "skor": 55, "alim_min": 24.56, "alim_max": 25.57, "alim_durum": "ŞİMDİ", "stop": 21.35, "kar_hedef_1": 26.76, "kar_hedef_2": 29.07, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 9.48, "beklenen_kar_yuzde_2": 18.96, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 31.36, "menzil_asagi": 17.52, "roc10": -1.05, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-VESTL/", "patlama_adayi": false, "adx": 35.42, "macd_bullish": true, "macd_val": -0.3458, "macd_sig": -0.3638, "macd_hist": 0.018, "rvol": 0.64}, {"symbol": "HALKB", "fiyat": 43.44, "birim": "₺", "degisim": -0.82, "rsi": 31.59, "skor": 30, "alim_min": 43.14, "alim_max": 44.92, "alim_durum": "ŞİMDİ", "stop": 40.1, "kar_hedef_1": 45.94, "kar_hedef_2": 48.45, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.77, "beklenen_kar_yuzde_2": 11.53, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 53.54, "menzil_asagi": 33.34, "roc10": -4.53, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-HALKB/", "patlama_adayi": false, "adx": 16.45, "macd_bullish": false, "macd_val": 0.0051, "macd_sig": 0.4161, "macd_hist": -0.411, "rvol": 0.9}, {"symbol": "EKGYO", "fiyat": 20.94, "birim": "₺", "degisim": 2.15, "rsi": 49.46, "skor": 80, "alim_min": 20.01, "alim_max": 20.84, "alim_durum": "YAKIN", "stop": 19.6, "kar_hedef_1": 21.94, "kar_hedef_2": 22.94, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.79, "beklenen_kar_yuzde_2": 9.57, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 24.77, "menzil_asagi": 17.11, "roc10": 0.0, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-EKGYO/", "patlama_adayi": false, "adx": 38.77, "macd_bullish": false, "macd_val": 0.3527, "macd_sig": 0.3857, "macd_hist": -0.033, "rvol": 1.05}, {"symbol": "VAKBN", "fiyat": 32.44, "birim": "₺", "degisim": 1.57, "rsi": 39.45, "skor": 53, "alim_min": 31.84, "alim_max": 33.15, "alim_durum": "ŞİMDİ", "stop": 30.44, "kar_hedef_1": 33.94, "kar_hedef_2": 35.44, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.63, "beklenen_kar_yuzde_2": 9.26, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 37.1, "menzil_asagi": 27.78, "roc10": -3.85, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-VAKBN/", "patlama_adayi": false, "adx": 18.36, "macd_bullish": false, "macd_val": -0.0085, "macd_sig": 0.1956, "macd_hist": -0.2041, "rvol": 1.0}, {"symbol": "DOHOL", "fiyat": 20.6, "birim": "₺", "degisim": -0.29, "rsi": 24.07, "skor": 50, "alim_min": 20.63, "alim_max": 21.48, "alim_durum": "ŞİMDİ", "stop": 19.4, "kar_hedef_1": 21.5, "kar_hedef_2": 22.4, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.37, "beklenen_kar_yuzde_2": 8.74, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 24.14, "menzil_asagi": 17.06, "roc10": -1.34, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-DOHOL/", "patlama_adayi": false, "adx": 35.92, "macd_bullish": false, "macd_val": -0.5317, "macd_sig": -0.4877, "macd_hist": -0.0441, "rvol": 0.73}, {"symbol": "ENKAI", "fiyat": 91.05, "birim": "₺", "degisim": 0.0, "rsi": 45.72, "skor": 116, "alim_min": 90.18, "alim_max": 93.9, "alim_durum": "ŞİMDİ", "stop": 86.06, "kar_hedef_1": 94.79, "kar_hedef_2": 98.53, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.11, "beklenen_kar_yuzde_2": 8.21, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 104.2, "menzil_asagi": 77.9, "roc10": 1.0, "garanti": true, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-ENKAI/", "patlama_adayi": true, "adx": 31.14, "macd_bullish": true, "macd_val": -1.5222, "macd_sig": -1.805, "macd_hist": 0.2829, "rvol": 0.81}, {"symbol": "SOKM", "fiyat": 45.28, "birim": "₺", "degisim": -0.53, "rsi": 29.33, "skor": 15, "alim_min": 45.9, "alim_max": 47.8, "alim_durum": "ŞİMDİ", "stop": 42.97, "kar_hedef_1": 47.01, "kar_hedef_2": 48.74, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.82, "beklenen_kar_yuzde_2": 7.65, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 51.45, "menzil_asagi": 39.11, "roc10": -5.78, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-SOKM/", "patlama_adayi": false, "adx": 30.77, "macd_bullish": false, "macd_val": -1.011, "macd_sig": -0.8234, "macd_hist": -0.1876, "rvol": 0.77}, {"symbol": "TCELL", "fiyat": 108.2, "birim": "₺", "degisim": -0.37, "rsi": 39.23, "skor": 63, "alim_min": 106.09, "alim_max": 110.46, "alim_durum": "ŞİMDİ", "stop": 102.51, "kar_hedef_1": 112.46, "kar_hedef_2": 116.73, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.94, "beklenen_kar_yuzde_2": 7.88, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 123.5, "menzil_asagi": 92.9, "roc10": -2.52, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-TCELL/", "patlama_adayi": false, "adx": 31.78, "macd_bullish": false, "macd_val": -0.3437, "macd_sig": 0.0274, "macd_hist": -0.3711, "rvol": 1.05}, {"symbol": "ENJSA", "fiyat": 104.5, "birim": "₺", "degisim": 1.26, "rsi": 43.46, "skor": 78, "alim_min": 102.49, "alim_max": 106.72, "alim_durum": "ŞİMDİ", "stop": 98.84, "kar_hedef_1": 108.74, "kar_hedef_2": 112.99, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.06, "beklenen_kar_yuzde_2": 8.12, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 116.9, "menzil_asagi": 92.1, "roc10": -0.95, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-ENJSA/", "patlama_adayi": false, "adx": 29.05, "macd_bullish": true, "macd_val": -1.9653, "macd_sig": -2.1503, "macd_hist": 0.185, "rvol": 1.07}, {"symbol": "MGROS", "fiyat": 648.5, "birim": "₺", "degisim": 1.49, "rsi": 37.55, "skor": 55, "alim_min": 645.73, "alim_max": 672.36, "alim_durum": "ŞİMDİ", "stop": 610.93, "kar_hedef_1": 676.68, "kar_hedef_2": 704.86, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.35, "beklenen_kar_yuzde_2": 8.69, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 736.5, "menzil_asagi": 560.5, "roc10": -6.89, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-MGROS/", "patlama_adayi": false, "adx": 26.04, "macd_bullish": false, "macd_val": -7.2777, "macd_sig": -1.0755, "macd_hist": -6.2022, "rvol": 1.19}, {"symbol": "KRDMD", "fiyat": 37.54, "birim": "₺", "degisim": -4.09, "rsi": 40.6, "skor": 53, "alim_min": 38.34, "alim_max": 39.92, "alim_durum": "ŞİMDİ", "stop": 34.64, "kar_hedef_1": 39.72, "kar_hedef_2": 41.89, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.8, "beklenen_kar_yuzde_2": 11.6, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 42.3, "menzil_asagi": 32.78, "roc10": -6.15, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-KRDMD/", "patlama_adayi": false, "adx": 18.11, "macd_bullish": false, "macd_val": -0.2238, "macd_sig": 0.0616, "macd_hist": -0.2854, "rvol": 1.06}, {"symbol": "OTKAR", "fiyat": 366.0, "birim": "₺", "degisim": -2.14, "rsi": 58.5, "skor": 68, "alim_min": 356.18, "alim_max": 370.86, "alim_durum": "ŞİMDİ", "stop": 343.68, "kar_hedef_1": 382.74, "kar_hedef_2": 399.48, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.57, "beklenen_kar_yuzde_2": 9.15, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 417.75, "menzil_asagi": 314.25, "roc10": 2.38, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-OTKAR/", "patlama_adayi": false, "adx": 29.8, "macd_bullish": true, "macd_val": 2.0704, "macd_sig": -0.0159, "macd_hist": 2.0863, "rvol": 0.48}, {"symbol": "CCOLA", "fiyat": 85.35, "birim": "₺", "degisim": 3.58, "rsi": 61.95, "skor": 90, "alim_min": 79.12, "alim_max": 82.38, "alim_durum": "BEKLE", "stop": 79.51, "kar_hedef_1": 89.73, "kar_hedef_2": 94.11, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.13, "beklenen_kar_yuzde_2": 10.27, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 97.5, "menzil_asagi": 73.2, "roc10": 9.99, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-CCOLA/", "patlama_adayi": false, "adx": 15.21, "macd_bullish": true, "macd_val": 1.124, "macd_sig": 0.62, "macd_hist": 0.5039, "rvol": 1.11}, {"symbol": "TTRAK", "fiyat": 436.75, "birim": "₺", "degisim": -0.74, "rsi": 48.17, "skor": 51, "alim_min": 428.23, "alim_max": 445.89, "alim_durum": "ŞİMDİ", "stop": 420.18, "kar_hedef_1": 449.18, "kar_hedef_2": 461.61, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 2.85, "beklenen_kar_yuzde_2": 5.69, "trend_yukselis": false, "sikisma": true, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "alcalan", "menzil_yukari": 466.0, "menzil_asagi": 407.5, "roc10": -0.57, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-TTRAK/", "patlama_adayi": true, "adx": 15.46, "macd_bullish": true, "macd_val": -2.7253, "macd_sig": -3.3089, "macd_hist": 0.5836, "rvol": 0.98}, {"symbol": "TTKOM", "fiyat": 59.3, "birim": "₺", "degisim": -1.9, "rsi": 37.84, "skor": 53, "alim_min": 59.78, "alim_max": 62.24, "alim_durum": "ŞİMDİ", "stop": 56.09, "kar_hedef_1": 61.71, "kar_hedef_2": 64.11, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.06, "beklenen_kar_yuzde_2": 8.11, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 66.35, "menzil_asagi": 52.25, "roc10": -3.26, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-TTKOM/", "patlama_adayi": false, "adx": 18.27, "macd_bullish": false, "macd_val": -0.6311, "macd_sig": -0.3349, "macd_hist": -0.2961, "rvol": 1.16}, {"symbol": "BRYAT", "fiyat": 1874.0, "birim": "₺", "degisim": -0.11, "rsi": 33.76, "skor": 15, "alim_min": 1865.25, "alim_max": 1942.16, "alim_durum": "ŞİMDİ", "stop": 1775.0, "kar_hedef_1": 1948.25, "kar_hedef_2": 2022.5, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.96, "beklenen_kar_yuzde_2": 7.92, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 2130.0, "menzil_asagi": 1618.0, "roc10": -3.1, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-BRYAT/", "patlama_adayi": false, "adx": 26.77, "macd_bullish": false, "macd_val": -35.2722, "macd_sig": -33.3908, "macd_hist": -1.8813, "rvol": 0.64}, {"symbol": "OYAKC", "fiyat": 20.72, "birim": "₺", "degisim": 0.78, "rsi": 38.38, "skor": 38, "alim_min": 20.4, "alim_max": 21.24, "alim_durum": "ŞİMDİ", "stop": 19.71, "kar_hedef_1": 21.47, "kar_hedef_2": 22.23, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.64, "beklenen_kar_yuzde_2": 7.28, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "alcalan", "menzil_yukari": 23.16, "menzil_asagi": 18.28, "roc10": -1.52, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-OYAKC/", "patlama_adayi": false, "adx": 26.97, "macd_bullish": true, "macd_val": -0.277, "macd_sig": -0.2907, "macd_hist": 0.0136, "rvol": 0.81}, {"symbol": "BRSAN", "fiyat": 552.0, "birim": "₺", "degisim": -1.25, "rsi": 30.25, "skor": 50, "alim_min": 554.2, "alim_max": 577.05, "alim_durum": "ŞİMDİ", "stop": 509.29, "kar_hedef_1": 584.04, "kar_hedef_2": 616.07, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.8, "beklenen_kar_yuzde_2": 11.61, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 711.5, "menzil_asagi": 392.5, "roc10": -6.04, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-BRSAN/", "patlama_adayi": false, "adx": 40.82, "macd_bullish": false, "macd_val": -3.4972, "macd_sig": 2.3071, "macd_hist": -5.8043, "rvol": 0.67}, {"symbol": "DOAS", "fiyat": 184.2, "birim": "₺", "degisim": -0.22, "rsi": 29.75, "skor": 54, "alim_min": 181.87, "alim_max": 189.37, "alim_durum": "ŞİMDİ", "stop": 175.0, "kar_hedef_1": 191.1, "kar_hedef_2": 198.0, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.75, "beklenen_kar_yuzde_2": 7.49, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": true, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 214.6, "menzil_asagi": 153.8, "roc10": -2.54, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-DOAS/", "patlama_adayi": false, "adx": 36.47, "macd_bullish": false, "macd_val": -1.4923, "macd_sig": -0.5131, "macd_hist": -0.9792, "rvol": 0.32}, {"symbol": "REEDR", "fiyat": 6.66, "birim": "₺", "degisim": 2.62, "rsi": 31.13, "skor": 24, "alim_min": 6.62, "alim_max": 6.89, "alim_durum": "ŞİMDİ", "stop": 6.3, "kar_hedef_1": 6.93, "kar_hedef_2": 7.21, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.1, "beklenen_kar_yuzde_2": 8.2, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": true, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 8.28, "menzil_asagi": 5.04, "roc10": -4.45, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-REEDR/", "patlama_adayi": false, "adx": 33.29, "macd_bullish": false, "macd_val": -0.2212, "macd_sig": -0.1992, "macd_hist": -0.022, "rvol": 1.26}, {"symbol": "MAVI", "fiyat": 39.9, "birim": "₺", "degisim": 1.63, "rsi": 35.57, "skor": 15, "alim_min": 39.07, "alim_max": 40.68, "alim_durum": "ŞİMDİ", "stop": 38.03, "kar_hedef_1": 41.3, "kar_hedef_2": 42.71, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.52, "beklenen_kar_yuzde_2": 7.04, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 47.38, "menzil_asagi": 32.42, "roc10": -0.99, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-MAVI/", "patlama_adayi": false, "adx": 58.23, "macd_bullish": false, "macd_val": -0.872, "macd_sig": -0.8065, "macd_hist": -0.0655, "rvol": 0.58}, {"symbol": "YEOTK", "fiyat": 94.95, "birim": "₺", "degisim": -1.66, "rsi": 29.05, "skor": 50, "alim_min": 99.0, "alim_max": 103.09, "alim_durum": "ŞİMDİ", "stop": 84.94, "kar_hedef_1": 102.46, "kar_hedef_2": 109.97, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 7.91, "beklenen_kar_yuzde_2": 15.82, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 126.65, "menzil_asagi": 63.25, "roc10": -9.57, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-YEOTK/", "patlama_adayi": false, "adx": 26.36, "macd_bullish": false, "macd_val": -1.4052, "macd_sig": 0.7836, "macd_hist": -2.1888, "rvol": 0.96}, {"symbol": "ISMEN", "fiyat": 35.92, "birim": "₺", "degisim": 0.9, "rsi": 34.62, "skor": 37, "alim_min": 35.62, "alim_max": 37.08, "alim_durum": "ŞİMDİ", "stop": 34.63, "kar_hedef_1": 36.89, "kar_hedef_2": 37.85, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 2.69, "beklenen_kar_yuzde_2": 5.38, "trend_yukselis": false, "sikisma": true, "hacim_kurumus": true, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Aşağı", "ucgen_tip": "yukselen", "menzil_yukari": 39.6, "menzil_asagi": 32.24, "roc10": -2.29, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-ISMEN/", "patlama_adayi": false, "adx": 18.42, "macd_bullish": true, "macd_val": -0.7112, "macd_sig": -0.7261, "macd_hist": 0.0149, "rvol": 1.07}, {"symbol": "MIATK", "fiyat": 35.52, "birim": "₺", "degisim": -2.04, "rsi": 11.5, "skor": 50, "alim_min": 39.83, "alim_max": 41.47, "alim_durum": "ŞİMDİ", "stop": 31.43, "kar_hedef_1": 38.59, "kar_hedef_2": 41.66, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 8.65, "beklenen_kar_yuzde_2": 17.29, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 57.97, "menzil_asagi": 17.76, "roc10": -16.7, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-MIATK/", "patlama_adayi": false, "adx": 46.18, "macd_bullish": false, "macd_val": -2.9462, "macd_sig": -2.1491, "macd_hist": -0.7971, "rvol": 0.54}, {"symbol": "SDTTR", "fiyat": 255.0, "birim": "₺", "degisim": -3.04, "rsi": 49.6, "skor": 98, "alim_min": 248.45, "alim_max": 258.7, "alim_durum": "ŞİMDİ", "stop": 225.89, "kar_hedef_1": 276.84, "kar_hedef_2": 298.67, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 8.56, "beklenen_kar_yuzde_2": 17.13, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 313.75, "menzil_asagi": 196.25, "roc10": 2.0, "garanti": true, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-SDTTR/", "patlama_adayi": false, "adx": 23.23, "macd_bullish": true, "macd_val": 4.6154, "macd_sig": 3.2008, "macd_hist": 1.4145, "rvol": 1.06}, {"symbol": "EUPWR", "fiyat": 88.2, "birim": "₺", "degisim": 1.79, "rsi": 45.54, "skor": 59, "alim_min": 82.49, "alim_max": 85.9, "alim_durum": "BEKLE", "stop": 74.14, "kar_hedef_1": 98.75, "kar_hedef_2": 109.3, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 11.96, "beklenen_kar_yuzde_2": 23.92, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": true, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 122.85, "menzil_asagi": 53.55, "roc10": -5.11, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-EUPWR/", "patlama_adayi": false, "adx": 17.84, "macd_bullish": false, "macd_val": 1.8279, "macd_sig": 2.9751, "macd_hist": -1.1473, "rvol": 0.42}, {"symbol": "ALFAS", "fiyat": 46.38, "birim": "₺", "degisim": 1.09, "rsi": 17.23, "skor": 54, "alim_min": 48.99, "alim_max": 51.01, "alim_durum": "ŞİMDİ", "stop": 41.34, "kar_hedef_1": 50.16, "kar_hedef_2": 53.94, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 8.15, "beklenen_kar_yuzde_2": 16.3, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": true, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 67.6, "menzil_asagi": 25.16, "roc10": -12.24, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-ALFAS/", "patlama_adayi": false, "adx": 49.44, "macd_bullish": false, "macd_val": -1.9448, "macd_sig": -0.9657, "macd_hist": -0.9791, "rvol": 0.6}, {"symbol": "GESAN", "fiyat": 80.45, "birim": "₺", "degisim": 2.88, "rsi": 53.14, "skor": 74, "alim_min": 73.25, "alim_max": 76.27, "alim_durum": "BEKLE", "stop": 68.19, "kar_hedef_1": 89.64, "kar_hedef_2": 98.84, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 11.43, "beklenen_kar_yuzde_2": 22.85, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": true, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 109.65, "menzil_asagi": 51.25, "roc10": 4.14, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-GESAN/", "patlama_adayi": false, "adx": 19.65, "macd_bullish": false, "macd_val": 1.045, "macd_sig": 1.2041, "macd_hist": -0.1591, "rvol": 0.2}, {"symbol": "CWENE", "fiyat": 40.9, "birim": "₺", "degisim": 2.25, "rsi": 53.05, "skor": 113, "alim_min": 37.96, "alim_max": 39.53, "alim_durum": "BEKLE", "stop": 36.55, "kar_hedef_1": 44.16, "kar_hedef_2": 47.43, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 7.98, "beklenen_kar_yuzde_2": 15.96, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "yukselen", "menzil_yukari": 50.68, "menzil_asagi": 31.12, "roc10": 2.82, "garanti": true, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-CWENE/", "patlama_adayi": false, "adx": 23.5, "macd_bullish": true, "macd_val": 0.4681, "macd_sig": 0.3053, "macd_hist": 0.1628, "rvol": 1.27}, {"symbol": "CANTE", "fiyat": 1.29, "birim": "₺", "degisim": -1.53, "rsi": 17.86, "skor": 15, "alim_min": 1.36, "alim_max": 1.42, "alim_durum": "ŞİMDİ", "stop": 1.2, "kar_hedef_1": 1.35, "kar_hedef_2": 1.42, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.98, "beklenen_kar_yuzde_2": 9.97, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 1.61, "menzil_asagi": 0.97, "roc10": -12.24, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-CANTE/", "patlama_adayi": false, "adx": 37.13, "macd_bullish": false, "macd_val": -0.0659, "macd_sig": -0.0579, "macd_hist": -0.0079, "rvol": 0.68}, {"symbol": "AEFES", "fiyat": 20.52, "birim": "₺", "degisim": 1.48, "rsi": 42.78, "skor": 86, "alim_min": 19.99, "alim_max": 20.82, "alim_durum": "ŞİMDİ", "stop": 19.29, "kar_hedef_1": 21.45, "kar_hedef_2": 22.37, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.51, "beklenen_kar_yuzde_2": 9.02, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "yukselen", "menzil_yukari": 22.97, "menzil_asagi": 18.07, "roc10": -0.1, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-AEFES/", "patlama_adayi": true, "adx": 19.11, "macd_bullish": false, "macd_val": 0.1379, "macd_sig": 0.2625, "macd_hist": -0.1246, "rvol": 1.06}, {"symbol": "TAVHL", "fiyat": 272.25, "birim": "₺", "degisim": -0.09, "rsi": 22.82, "skor": 30, "alim_min": 270.82, "alim_max": 281.99, "alim_durum": "ŞİMDİ", "stop": 256.61, "kar_hedef_1": 283.98, "kar_hedef_2": 295.71, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.31, "beklenen_kar_yuzde_2": 8.62, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 333.8, "menzil_asagi": 210.7, "roc10": -4.47, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-TAVHL/", "patlama_adayi": false, "adx": 42.52, "macd_bullish": false, "macd_val": 0.6509, "macd_sig": 2.5324, "macd_hist": -1.8815, "rvol": 0.9}, {"symbol": "EGEEN", "fiyat": 5590.0, "birim": "₺", "degisim": -0.93, "rsi": 49.21, "skor": 81, "alim_min": 5479.52, "alim_max": 5705.48, "alim_durum": "ŞİMDİ", "stop": 5197.86, "kar_hedef_1": 5884.11, "kar_hedef_2": 6178.21, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.26, "beklenen_kar_yuzde_2": 10.52, "trend_yukselis": false, "sikisma": true, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 6190.0, "menzil_asagi": 4990.0, "roc10": 0.99, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-EGEEN/", "patlama_adayi": true, "adx": 20.43, "macd_bullish": true, "macd_val": -38.6109, "macd_sig": -62.4986, "macd_hist": 23.8877, "rvol": 0.63}, {"symbol": "BFREN", "fiyat": 135.2, "birim": "₺", "degisim": -0.15, "rsi": 33.59, "skor": 28, "alim_min": 133.32, "alim_max": 138.81, "alim_durum": "ŞİMDİ", "stop": 130.74, "kar_hedef_1": 138.54, "kar_hedef_2": 141.89, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 2.47, "beklenen_kar_yuzde_2": 4.95, "trend_yukselis": false, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 156.4, "menzil_asagi": 114.0, "roc10": -2.24, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-BFREN/", "patlama_adayi": false, "adx": 22.74, "macd_bullish": false, "macd_val": -1.5094, "macd_sig": -1.4906, "macd_hist": -0.0189, "rvol": 0.73}, {"symbol": "BOBET", "fiyat": 19.4, "birim": "₺", "degisim": 0.47, "rsi": 63.02, "skor": 79, "alim_min": 18.54, "alim_max": 19.3, "alim_durum": "YAKIN", "stop": 18.12, "kar_hedef_1": 20.36, "kar_hedef_2": 21.32, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.94, "beklenen_kar_yuzde_2": 9.87, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": true, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 21.85, "menzil_asagi": 16.95, "roc10": 0.41, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-BOBET/", "patlama_adayi": false, "adx": 27.26, "macd_bullish": true, "macd_val": 0.0523, "macd_sig": 0.0092, "macd_hist": 0.043, "rvol": 0.79}, {"symbol": "TKFEN", "fiyat": 132.7, "birim": "₺", "degisim": -1.34, "rsi": 46.58, "skor": 63, "alim_min": 133.05, "alim_max": 138.53, "alim_durum": "ŞİMDİ", "stop": 118.06, "kar_hedef_1": 143.68, "kar_hedef_2": 154.66, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 8.28, "beklenen_kar_yuzde_2": 16.55, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 163.8, "menzil_asagi": 101.6, "roc10": 2.23, "garanti": false, "acik_mi": false, "hacim_yuksek": false, "piyasa_id": "TR", "tv_link": "https://tr.tradingview.com/symbols/BIST-TKFEN/", "patlama_adayi": false, "adx": 21.19, "macd_bullish": false, "macd_val": -0.285, "macd_sig": -0.0446, "macd_hist": -0.2404, "rvol": 0.69}, {"symbol": "TSLA", "fiyat": 407.19, "birim": "$", "degisim": -3.0, "rsi": 48.86, "skor": 108, "alim_min": 392.27, "alim_max": 408.45, "alim_durum": "ŞİMDİ", "stop": 366.9, "kar_hedef_1": 437.4, "kar_hedef_2": 467.62, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 7.42, "beklenen_kar_yuzde_2": 14.84, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 484.19, "menzil_asagi": 330.19, "roc10": 0.53, "garanti": true, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/TSLA/", "patlama_adayi": false, "adx": 27.22, "macd_bullish": true, "macd_val": 0.1839, "macd_sig": -2.0748, "macd_hist": 2.2588, "rvol": 0.53}, {"symbol": "NVDA", "fiyat": 197.62, "birim": "$", "degisim": 1.06, "rsi": 34.42, "skor": 50, "alim_min": 195.85, "alim_max": 203.92, "alim_durum": "ŞİMDİ", "stop": 184.98, "kar_hedef_1": 207.09, "kar_hedef_2": 216.57, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.8, "beklenen_kar_yuzde_2": 9.59, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 240.1, "menzil_asagi": 155.14, "roc10": -5.29, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/NVDA/", "patlama_adayi": false, "adx": 29.8, "macd_bullish": false, "macd_val": -3.9554, "macd_sig": -3.428, "macd_hist": -0.5274, "rvol": 0.58}, {"symbol": "AAPL", "fiyat": 312.27, "birim": "$", "degisim": -0.12, "rsi": 60.85, "skor": 110, "alim_min": 288.65, "alim_max": 300.55, "alim_durum": "BEKLE", "stop": 294.62, "kar_hedef_1": 325.51, "kar_hedef_2": 338.74, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.24, "beklenen_kar_yuzde_2": 8.48, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 355.92, "menzil_asagi": 268.62, "roc10": 5.14, "garanti": true, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/AAPL/", "patlama_adayi": false, "adx": 33.81, "macd_bullish": true, "macd_val": 2.0761, "macd_sig": -0.0356, "macd_hist": 2.1117, "rvol": 0.37}, {"symbol": "AMZN", "fiyat": 246.28, "birim": "$", "degisim": 0.87, "rsi": 50.22, "skor": 110, "alim_min": 235.67, "alim_max": 245.38, "alim_durum": "YAKIN", "stop": 229.83, "kar_hedef_1": 258.62, "kar_hedef_2": 270.96, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.01, "beklenen_kar_yuzde_2": 10.02, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 295.48, "menzil_asagi": 197.08, "roc10": 5.79, "garanti": true, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/AMZN/", "patlama_adayi": false, "adx": 42.53, "macd_bullish": true, "macd_val": -2.9308, "macd_sig": -4.5696, "macd_hist": 1.6388, "rvol": 0.43}, {"symbol": "AMD", "fiyat": 522.88, "birim": "$", "degisim": -5.28, "rsi": 46.26, "skor": 75, "alim_min": 504.35, "alim_max": 525.14, "alim_durum": "ŞİMDİ", "stop": 445.58, "kar_hedef_1": 580.84, "kar_hedef_2": 638.81, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 11.09, "beklenen_kar_yuzde_2": 22.17, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 670.37, "menzil_asagi": 375.38, "roc10": -5.21, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/AMD/", "patlama_adayi": false, "adx": 18.72, "macd_bullish": false, "macd_val": 20.6826, "macd_sig": 24.9538, "macd_hist": -4.2712, "rvol": 0.63}, {"symbol": "MSFT", "fiyat": 391.97, "birim": "$", "degisim": 1.35, "rsi": 46.66, "skor": 60, "alim_min": 376.01, "alim_max": 391.51, "alim_durum": "YAKIN", "stop": 365.98, "kar_hedef_1": 411.47, "kar_hedef_2": 430.96, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.97, "beklenen_kar_yuzde_2": 9.95, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 509.09, "menzil_asagi": 274.85, "roc10": 6.7, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/MSFT/", "patlama_adayi": false, "adx": 43.57, "macd_bullish": true, "macd_val": -7.0974, "macd_sig": -9.734, "macd_hist": 2.6366, "rvol": 0.41}, {"symbol": "META", "fiyat": 624.14, "birim": "$", "degisim": 3.97, "rsi": 56.82, "skor": 65, "alim_min": 568.27, "alim_max": 591.7, "alim_durum": "BEKLE", "stop": 578.41, "kar_hedef_1": 658.44, "kar_hedef_2": 692.74, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.5, "beklenen_kar_yuzde_2": 10.99, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 726.36, "menzil_asagi": 521.92, "roc10": 10.69, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/META/", "patlama_adayi": false, "adx": 23.35, "macd_bullish": true, "macd_val": -1.6828, "macd_sig": -8.9308, "macd_hist": 7.248, "rvol": 0.61}, {"symbol": "GOOGL", "fiyat": 369.48, "birim": "$", "degisim": 0.82, "rsi": 50.08, "skor": 75, "alim_min": 350.02, "alim_max": 364.45, "alim_durum": "YAKIN", "stop": 346.06, "kar_hedef_1": 387.05, "kar_hedef_2": 404.62, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.75, "beklenen_kar_yuzde_2": 9.51, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 432.92, "menzil_asagi": 306.04, "roc10": 5.66, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/GOOGL/", "patlama_adayi": false, "adx": 17.46, "macd_bullish": true, "macd_val": -1.9812, "macd_sig": -3.9626, "macd_hist": 1.9814, "rvol": 0.4}, {"symbol": "NFLX", "fiyat": 76.49, "birim": "$", "degisim": 0.62, "rsi": 39.75, "skor": 35, "alim_min": 74.9, "alim_max": 77.99, "alim_durum": "ŞİMDİ", "stop": 70.77, "kar_hedef_1": 80.78, "kar_hedef_2": 85.07, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.61, "beklenen_kar_yuzde_2": 11.21, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 95.6, "menzil_asagi": 57.38, "roc10": 4.95, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/NFLX/", "patlama_adayi": false, "adx": 62.13, "macd_bullish": true, "macd_val": -2.6347, "macd_sig": -3.2761, "macd_hist": 0.6414, "rvol": 0.42}, {"symbol": "BABA", "fiyat": 98.28, "birim": "$", "degisim": 0.38, "rsi": 21.36, "skor": 30, "alim_min": 102.01, "alim_max": 106.21, "alim_durum": "ŞİMDİ", "stop": 91.95, "kar_hedef_1": 103.03, "kar_hedef_2": 107.77, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.83, "beklenen_kar_yuzde_2": 9.66, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 139.16, "menzil_asagi": 57.4, "roc10": -6.37, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/BABA/", "patlama_adayi": false, "adx": 68.58, "macd_bullish": true, "macd_val": -7.3171, "macd_sig": -7.5104, "macd_hist": 0.1933, "rvol": 0.61}, {"symbol": "COIN", "fiyat": 166.15, "birim": "$", "degisim": -1.61, "rsi": 47.53, "skor": 96, "alim_min": 157.52, "alim_max": 164.02, "alim_durum": "YAKIN", "stop": 145.04, "kar_hedef_1": 181.98, "kar_hedef_2": 197.82, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 9.53, "beklenen_kar_yuzde_2": 19.06, "trend_yukselis": false, "sikisma": true, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 222.56, "menzil_asagi": 109.74, "roc10": 0.79, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/COIN/", "patlama_adayi": true, "adx": 20.64, "macd_bullish": true, "macd_val": -4.0506, "macd_sig": -6.5137, "macd_hist": 2.4631, "rvol": 0.38}, {"symbol": "INTC", "fiyat": 110.9, "birim": "$", "degisim": -9.25, "rsi": 40.93, "skor": 30, "alim_min": 119.23, "alim_max": 124.15, "alim_durum": "ŞİMDİ", "stop": 88.42, "kar_hedef_1": 127.76, "kar_hedef_2": 144.62, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 15.2, "beklenen_kar_yuzde_2": 30.41, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 154.92, "menzil_asagi": 66.88, "roc10": -21.31, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/INTC/", "patlama_adayi": false, "adx": 14.76, "macd_bullish": false, "macd_val": 3.0755, "macd_sig": 5.5818, "macd_hist": -2.5063, "rvol": 0.77}, {"symbol": "QCOM", "fiyat": 183.14, "birim": "$", "degisim": -1.79, "rsi": 31.05, "skor": 30, "alim_min": 192.75, "alim_max": 200.7, "alim_durum": "ŞİMDİ", "stop": 153.76, "kar_hedef_1": 205.18, "kar_hedef_2": 227.21, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 12.03, "beklenen_kar_yuzde_2": 24.06, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 270.94, "menzil_asagi": 95.34, "roc10": -17.47, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/QCOM/", "patlama_adayi": false, "adx": 11.34, "macd_bullish": false, "macd_val": -7.3916, "macd_sig": -3.6558, "macd_hist": -3.7358, "rvol": 0.32}, {"symbol": "AVGO", "fiyat": 371.19, "birim": "$", "degisim": -0.72, "rsi": 42.5, "skor": 50, "alim_min": 372.94, "alim_max": 388.31, "alim_durum": "ŞİMDİ", "stop": 338.49, "kar_hedef_1": 395.72, "kar_hedef_2": 420.24, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 6.61, "beklenen_kar_yuzde_2": 13.21, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 508.98, "menzil_asagi": 233.4, "roc10": -5.34, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/AVGO/", "patlama_adayi": false, "adx": 32.41, "macd_bullish": false, "macd_val": -10.7556, "macd_sig": -9.7663, "macd_hist": -0.9893, "rvol": 0.4}, {"symbol": "ADBE", "fiyat": 225.62, "birim": "$", "degisim": 3.46, "rsi": 66.53, "skor": 75, "alim_min": 209.75, "alim_max": 218.4, "alim_durum": "BEKLE", "stop": 209.08, "kar_hedef_1": 238.02, "kar_hedef_2": 250.42, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.5, "beklenen_kar_yuzde_2": 11.0, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 310.94, "menzil_asagi": 140.29, "roc10": 15.76, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/ADBE/", "patlama_adayi": false, "adx": 45.45, "macd_bullish": true, "macd_val": -5.9135, "macd_sig": -9.6127, "macd_hist": 3.6993, "rvol": 0.65}, {"symbol": "CRM", "fiyat": 171.85, "birim": "$", "degisim": 3.75, "rsi": 57.78, "skor": 75, "alim_min": 159.9, "alim_max": 166.5, "alim_durum": "BEKLE", "stop": 159.62, "kar_hedef_1": 181.03, "kar_hedef_2": 190.2, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.34, "beklenen_kar_yuzde_2": 10.68, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 236.33, "menzil_asagi": 107.38, "roc10": 14.48, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/CRM/", "patlama_adayi": false, "adx": 40.56, "macd_bullish": true, "macd_val": -3.1905, "macd_sig": -5.2683, "macd_hist": 2.0778, "rvol": 0.5}, {"symbol": "INTU", "fiyat": 282.1, "birim": "$", "degisim": 3.66, "rsi": 50.2, "skor": 75, "alim_min": 272.92, "alim_max": 284.18, "alim_durum": "ŞİMDİ", "stop": 258.1, "kar_hedef_1": 300.1, "kar_hedef_2": 318.11, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 6.38, "beklenen_kar_yuzde_2": 12.76, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "alcalan", "menzil_yukari": 392.44, "menzil_asagi": 171.76, "roc10": 9.44, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/INTU/", "patlama_adayi": false, "adx": 28.02, "macd_bullish": true, "macd_val": -15.2446, "macd_sig": -20.457, "macd_hist": 5.2123, "rvol": 0.44}, {"symbol": "AMAT", "fiyat": 550.86, "birim": "$", "degisim": -7.07, "rsi": 46.74, "skor": 60, "alim_min": 568.71, "alim_max": 592.16, "alim_durum": "ŞİMDİ", "stop": 441.6, "kar_hedef_1": 632.8, "kar_hedef_2": 714.75, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 14.88, "beklenen_kar_yuzde_2": 29.75, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 860.24, "menzil_asagi": 275.43, "roc10": -13.95, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/AMAT/", "patlama_adayi": false, "adx": 40.44, "macd_bullish": false, "macd_val": 36.343, "macd_sig": 47.0015, "macd_hist": -10.6586, "rvol": 0.59}, {"symbol": "BKNG", "fiyat": 182.15, "birim": "$", "degisim": 0.62, "rsi": 57.9, "skor": 65, "alim_min": 170.21, "alim_max": 177.23, "alim_durum": "BEKLE", "stop": 169.2, "kar_hedef_1": 191.86, "kar_hedef_2": 201.57, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.33, "beklenen_kar_yuzde_2": 10.66, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 212.34, "menzil_asagi": 151.96, "roc10": 8.57, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/BKNG/", "patlama_adayi": false, "adx": 24.35, "macd_bullish": true, "macd_val": 4.3549, "macd_sig": 3.4997, "macd_hist": 0.8552, "rvol": 0.26}, {"symbol": "ISRG", "fiyat": 425.28, "birim": "$", "degisim": -1.74, "rsi": 55.15, "skor": 65, "alim_min": 402.31, "alim_max": 418.9, "alim_durum": "YAKIN", "stop": 399.08, "kar_hedef_1": 444.93, "kar_hedef_2": 464.58, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.62, "beklenen_kar_yuzde_2": 9.24, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 472.46, "menzil_asagi": 378.1, "roc10": 5.54, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/ISRG/", "patlama_adayi": false, "adx": 20.24, "macd_bullish": true, "macd_val": -2.1298, "macd_sig": -6.1081, "macd_hist": 3.9783, "rvol": 0.64}, {"symbol": "MU", "fiyat": 932.18, "birim": "$", "degisim": -5.34, "rsi": 41.63, "skor": 30, "alim_min": 989.17, "alim_max": 1029.96, "alim_durum": "ŞİMDİ", "stop": 723.38, "kar_hedef_1": 1088.78, "kar_hedef_2": 1245.38, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 16.8, "beklenen_kar_yuzde_2": 33.6, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 1439.9, "menzil_asagi": 466.09, "roc10": -23.04, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/MU/", "patlama_adayi": false, "adx": 11.6, "macd_bullish": false, "macd_val": 38.9553, "macd_sig": 70.8444, "macd_hist": -31.8891, "rvol": 0.68}, {"symbol": "LRCX", "fiyat": 325.57, "birim": "$", "degisim": -7.03, "rsi": 39.94, "skor": 50, "alim_min": 352.42, "alim_max": 366.96, "alim_durum": "ŞİMDİ", "stop": 262.12, "kar_hedef_1": 373.15, "kar_hedef_2": 420.73, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 14.61, "beklenen_kar_yuzde_2": 29.23, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 461.54, "menzil_asagi": 189.59, "roc10": -20.5, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/LRCX/", "patlama_adayi": false, "adx": 28.05, "macd_bullish": false, "macd_val": 11.5911, "macd_sig": 20.4085, "macd_hist": -8.8174, "rvol": 0.62}, {"symbol": "TXN", "fiyat": 294.3, "birim": "$", "degisim": -3.03, "rsi": 43.39, "skor": 30, "alim_min": 290.57, "alim_max": 302.55, "alim_durum": "ŞİMDİ", "stop": 261.3, "kar_hedef_1": 319.05, "kar_hedef_2": 343.79, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 8.41, "beklenen_kar_yuzde_2": 16.82, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 354.45, "menzil_asagi": 234.15, "roc10": -11.43, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/TXN/", "patlama_adayi": false, "adx": 11.67, "macd_bullish": false, "macd_val": 0.575, "macd_sig": 2.5442, "macd_hist": -1.9691, "rvol": 0.36}, {"symbol": "XOM", "fiyat": 139.7, "birim": "$", "degisim": 2.39, "rsi": 46.55, "skor": 85, "alim_min": 136.56, "alim_max": 142.19, "alim_durum": "ŞİMDİ", "stop": 134.43, "kar_hedef_1": 143.65, "kar_hedef_2": 147.61, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 2.83, "beklenen_kar_yuzde_2": 5.66, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 160.3, "menzil_asagi": 119.1, "roc10": 0.89, "garanti": true, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/XOM/", "patlama_adayi": false, "adx": 49.17, "macd_bullish": true, "macd_val": -3.2547, "macd_sig": -3.439, "macd_hist": 0.1843, "rvol": 0.37}, {"symbol": "MDLZ", "fiyat": 59.75, "birim": "$", "degisim": 0.98, "rsi": 45.65, "skor": 45, "alim_min": 58.45, "alim_max": 60.86, "alim_durum": "ŞİMDİ", "stop": 56.38, "kar_hedef_1": 62.28, "kar_hedef_2": 64.81, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.23, "beklenen_kar_yuzde_2": 8.46, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": true, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 65.79, "menzil_asagi": 53.71, "roc10": 1.24, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/MDLZ/", "patlama_adayi": false, "adx": 15.25, "macd_bullish": false, "macd_val": -0.3265, "macd_sig": -0.1774, "macd_hist": -0.1491, "rvol": 0.44}, {"symbol": "CDNS", "fiyat": 373.78, "birim": "$", "degisim": -0.53, "rsi": 32.98, "skor": 58, "alim_min": 366.41, "alim_max": 381.52, "alim_durum": "ŞİMDİ", "stop": 346.42, "kar_hedef_1": 394.3, "kar_hedef_2": 414.82, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.49, "beklenen_kar_yuzde_2": 10.98, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 431.71, "menzil_asagi": 315.85, "roc10": -3.92, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/CDNS/", "patlama_adayi": false, "adx": 27.43, "macd_bullish": false, "macd_val": 0.5852, "macd_sig": 3.0591, "macd_hist": -2.474, "rvol": 0.3}, {"symbol": "SNPS", "fiyat": 436.75, "birim": "$", "degisim": -1.25, "rsi": 40.67, "skor": 18, "alim_min": 443.57, "alim_max": 461.86, "alim_durum": "ŞİMDİ", "stop": 402.03, "kar_hedef_1": 462.79, "kar_hedef_2": 488.83, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.96, "beklenen_kar_yuzde_2": 11.92, "trend_yukselis": false, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 545.85, "menzil_asagi": 327.65, "roc10": -5.99, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/SNPS/", "patlama_adayi": false, "adx": 17.18, "macd_bullish": false, "macd_val": -10.4308, "macd_sig": -9.0853, "macd_hist": -1.3454, "rvol": 0.33}, {"symbol": "MELI", "fiyat": 1827.91, "birim": "$", "degisim": 1.23, "rsi": 70.19, "skor": 55, "alim_min": 1642.36, "alim_max": 1710.09, "alim_durum": "BEKLE", "stop": 1708.49, "kar_hedef_1": 1917.48, "kar_hedef_2": 2007.05, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.9, "beklenen_kar_yuzde_2": 9.8, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 2117.99, "menzil_asagi": 1537.83, "roc10": 15.0, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/MELI/", "patlama_adayi": false, "adx": 23.66, "macd_bullish": true, "macd_val": 30.5645, "macd_sig": 6.2129, "macd_hist": 24.3516, "rvol": 0.37}, {"symbol": "REGN", "fiyat": 672.12, "birim": "$", "degisim": 3.43, "rsi": 77.09, "skor": 55, "alim_min": 615.12, "alim_max": 640.49, "alim_durum": "BEKLE", "stop": 638.84, "kar_hedef_1": 697.08, "kar_hedef_2": 722.05, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.71, "beklenen_kar_yuzde_2": 7.43, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 756.2, "menzil_asagi": 588.04, "roc10": 9.73, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/REGN/", "patlama_adayi": false, "adx": 24.44, "macd_bullish": true, "macd_val": 1.0783, "macd_sig": -7.2464, "macd_hist": 8.3246, "rvol": 0.43}, {"symbol": "ABNB", "fiyat": 148.97, "birim": "$", "degisim": 0.89, "rsi": 64.64, "skor": 110, "alim_min": 137.98, "alim_max": 143.67, "alim_durum": "BEKLE", "stop": 140.34, "kar_hedef_1": 155.44, "kar_hedef_2": 161.91, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.34, "beklenen_kar_yuzde_2": 8.69, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 171.93, "menzil_asagi": 126.01, "roc10": 7.03, "garanti": true, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/ABNB/", "patlama_adayi": false, "adx": 44.9, "macd_bullish": true, "macd_val": 3.4584, "macd_sig": 2.6144, "macd_hist": 0.844, "rvol": 0.25}, {"symbol": "ASML", "fiyat": 1753.8, "birim": "$", "degisim": -3.91, "rsi": 43.38, "skor": 50, "alim_min": 1744.55, "alim_max": 1816.49, "alim_durum": "ŞİMDİ", "stop": 1544.33, "kar_hedef_1": 1910.9, "kar_hedef_2": 2068.0, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 8.96, "beklenen_kar_yuzde_2": 17.92, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 2173.76, "menzil_asagi": 1333.84, "roc10": -9.09, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/ASML/", "patlama_adayi": false, "adx": 28.01, "macd_bullish": false, "macd_val": 41.7996, "macd_sig": 61.7945, "macd_hist": -19.9949, "rvol": 0.53}, {"symbol": "PYPL", "fiyat": 45.67, "birim": "$", "degisim": 1.28, "rsi": 64.05, "skor": 75, "alim_min": 42.42, "alim_max": 44.17, "alim_durum": "BEKLE", "stop": 42.71, "kar_hedef_1": 47.88, "kar_hedef_2": 50.1, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.86, "beklenen_kar_yuzde_2": 9.72, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 51.53, "menzil_asagi": 39.8, "roc10": 7.85, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/PYPL/", "patlama_adayi": false, "adx": 26.96, "macd_bullish": true, "macd_val": 0.2705, "macd_sig": -0.2211, "macd_hist": 0.4915, "rvol": 0.35}, {"symbol": "TSM", "fiyat": 434.3, "birim": "$", "degisim": -3.87, "rsi": 48.42, "skor": 40, "alim_min": 425.3, "alim_max": 442.83, "alim_durum": "ŞİMDİ", "stop": 387.24, "kar_hedef_1": 469.59, "kar_hedef_2": 504.88, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 8.13, "beklenen_kar_yuzde_2": 16.25, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 511.38, "menzil_asagi": 357.22, "roc10": -7.14, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/TSM/", "patlama_adayi": false, "adx": 12.72, "macd_bullish": false, "macd_val": 7.7362, "macd_sig": 9.5361, "macd_hist": -1.7999, "rvol": 0.63}, {"symbol": "V", "fiyat": 350.11, "birim": "$", "degisim": -2.0, "rsi": 69.69, "skor": 105, "alim_min": 327.53, "alim_max": 341.04, "alim_durum": "BEKLE", "stop": 332.28, "kar_hedef_1": 363.49, "kar_hedef_2": 376.87, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.82, "beklenen_kar_yuzde_2": 7.64, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 406.13, "menzil_asagi": 294.1, "roc10": 7.2, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/V/", "patlama_adayi": false, "adx": 44.72, "macd_bullish": true, "macd_val": 8.0507, "macd_sig": 5.4281, "macd_hist": 2.6226, "rvol": 0.52}, {"symbol": "LLY", "fiyat": 1231.91, "birim": "$", "degisim": 2.65, "rsi": 69.12, "skor": 95, "alim_min": 1120.19, "alim_max": 1166.39, "alim_durum": "BEKLE", "stop": 1152.6, "kar_hedef_1": 1291.39, "kar_hedef_2": 1350.88, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.83, "beklenen_kar_yuzde_2": 9.66, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 1434.29, "menzil_asagi": 1029.53, "roc10": 11.78, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/LLY/", "patlama_adayi": false, "adx": 18.84, "macd_bullish": true, "macd_val": 40.3167, "macd_sig": 36.194, "macd_hist": 4.1227, "rvol": 0.52}, {"symbol": "JPM", "fiyat": 338.66, "birim": "$", "degisim": 0.28, "rsi": 68.93, "skor": 113, "alim_min": 315.75, "alim_max": 328.77, "alim_durum": "BEKLE", "stop": 322.85, "kar_hedef_1": 350.52, "kar_hedef_2": 362.38, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.5, "beklenen_kar_yuzde_2": 7.0, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 386.69, "menzil_asagi": 290.63, "roc10": 2.63, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/JPM/", "patlama_adayi": false, "adx": 54.95, "macd_bullish": true, "macd_val": 7.3666, "macd_sig": 6.844, "macd_hist": 0.5226, "rvol": 0.33}, {"symbol": "WMT", "fiyat": 111.46, "birim": "$", "degisim": 0.73, "rsi": 28.65, "skor": 50, "alim_min": 112.5, "alim_max": 117.14, "alim_durum": "ŞİMDİ", "stop": 105.56, "kar_hedef_1": 115.89, "kar_hedef_2": 120.32, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.97, "beklenen_kar_yuzde_2": 7.95, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 127.15, "menzil_asagi": 95.77, "roc10": -4.88, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/WMT/", "patlama_adayi": false, "adx": 31.83, "macd_bullish": false, "macd_val": -2.9145, "macd_sig": -2.4307, "macd_hist": -0.4838, "rvol": 0.43}, {"symbol": "HD", "fiyat": 345.26, "birim": "$", "degisim": -1.54, "rsi": 59.27, "skor": 75, "alim_min": 328.05, "alim_max": 341.58, "alim_durum": "YAKIN", "stop": 326.27, "kar_hedef_1": 359.5, "kar_hedef_2": 373.75, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.13, "beklenen_kar_yuzde_2": 8.25, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 397.04, "menzil_asagi": 293.48, "roc10": 5.71, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/HD/", "patlama_adayi": false, "adx": 43.3, "macd_bullish": true, "macd_val": 8.5976, "macd_sig": 7.3425, "macd_hist": 1.255, "rvol": 0.31}, {"symbol": "MA", "fiyat": 530.78, "birim": "$", "degisim": -0.44, "rsi": 69.52, "skor": 75, "alim_min": 491.59, "alim_max": 511.87, "alim_durum": "BEKLE", "stop": 504.24, "kar_hedef_1": 550.68, "kar_hedef_2": 570.59, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.75, "beklenen_kar_yuzde_2": 7.5, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 609.91, "menzil_asagi": 451.65, "roc10": 9.64, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/MA/", "patlama_adayi": false, "adx": 41.61, "macd_bullish": true, "macd_val": 9.3495, "macd_sig": 4.2702, "macd_hist": 5.0793, "rvol": 0.57}, {"symbol": "PEP", "fiyat": 144.73, "birim": "$", "degisim": 1.0, "rsi": 47.44, "skor": 63, "alim_min": 138.27, "alim_max": 143.97, "alim_durum": "YAKIN", "stop": 137.5, "kar_hedef_1": 150.15, "kar_hedef_2": 155.57, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.75, "beklenen_kar_yuzde_2": 7.49, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 159.06, "menzil_asagi": 130.4, "roc10": 2.86, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/PEP/", "patlama_adayi": false, "adx": 14.32, "macd_bullish": true, "macd_val": -0.9206, "macd_sig": -1.5271, "macd_hist": 0.6065, "rvol": 0.48}, {"symbol": "KO", "fiyat": 83.69, "birim": "$", "degisim": 0.88, "rsi": 62.3, "skor": 85, "alim_min": 78.91, "alim_max": 82.16, "alim_durum": "YAKIN", "stop": 80.27, "kar_hedef_1": 86.25, "kar_hedef_2": 88.81, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.06, "beklenen_kar_yuzde_2": 6.12, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 93.05, "menzil_asagi": 74.33, "roc10": 5.23, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/KO/", "patlama_adayi": false, "adx": 17.03, "macd_bullish": true, "macd_val": 0.9755, "macd_sig": 0.7337, "macd_hist": 0.2418, "rvol": 0.42}, {"symbol": "BTCTRY", "fiyat": 2997370.86, "birim": "₺", "degisim": 0.02, "rsi": 55.89, "skor": 65, "alim_min": 2848999.03, "alim_max": 2966483.53, "alim_durum": "YAKIN", "stop": 2784013.96, "kar_hedef_1": 3157388.53, "kar_hedef_2": 3317406.2, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 5.34, "beklenen_kar_yuzde_2": 10.68, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 3442274.01, "menzil_asagi": 2552467.7, "roc10": 6.78, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-BTCUSDT/", "patlama_adayi": false, "adx": 28.86, "macd_bullish": true, "macd_val": -735.3002, "macd_sig": -1494.5478, "macd_hist": 759.2476, "rvol": 1.1}, {"symbol": "PG", "fiyat": 151.09, "birim": "$", "degisim": 1.19, "rsi": 51.2, "skor": 91, "alim_min": 144.11, "alim_max": 150.05, "alim_durum": "YAKIN", "stop": 144.61, "kar_hedef_1": 155.95, "kar_hedef_2": 160.81, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.22, "beklenen_kar_yuzde_2": 6.43, "trend_yukselis": false, "sikisma": true, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 165.71, "menzil_asagi": 136.47, "roc10": 2.31, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/PG/", "patlama_adayi": true, "adx": 29.76, "macd_bullish": false, "macd_val": 1.0996, "macd_sig": 1.1576, "macd_hist": -0.058, "rvol": 0.45}, {"symbol": "UNH", "fiyat": 425.67, "birim": "$", "degisim": 1.84, "rsi": 58.49, "skor": 98, "alim_min": 398.1, "alim_max": 414.52, "alim_durum": "BEKLE", "stop": 405.04, "kar_hedef_1": 441.15, "kar_hedef_2": 456.62, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.64, "beklenen_kar_yuzde_2": 7.27, "trend_yukselis": true, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 483.28, "menzil_asagi": 368.06, "roc10": 4.67, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/UNH/", "patlama_adayi": false, "adx": 54.07, "macd_bullish": false, "macd_val": 10.639, "macd_sig": 10.7375, "macd_hist": -0.0986, "rvol": 0.43}, {"symbol": "ETHTRY", "fiyat": 84369.58, "birim": "₺", "degisim": 0.22, "rsi": 65.79, "skor": 65, "alim_min": 77840.19, "alim_max": 81050.09, "alim_durum": "BEKLE", "stop": 76782.63, "kar_hedef_1": 90059.79, "kar_hedef_2": 95749.99, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 6.74, "beklenen_kar_yuzde_2": 13.49, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 100163.68, "menzil_asagi": 68575.47, "roc10": 14.64, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-ETHUSDT/", "patlama_adayi": false, "adx": 18.2, "macd_bullish": true, "macd_val": -2.6563, "macd_sig": -36.1549, "macd_hist": 33.4986, "rvol": 0.94}, {"symbol": "SOLTRY", "fiyat": 3847.09, "birim": "₺", "degisim": 0.29, "rsi": 75.99, "skor": 55, "alim_min": 3468.46, "alim_max": 3611.49, "alim_durum": "BEKLE", "stop": 3467.19, "kar_hedef_1": 4132.02, "kar_hedef_2": 4416.95, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 7.41, "beklenen_kar_yuzde_2": 14.81, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 4850.8, "menzil_asagi": 2843.39, "roc10": 16.67, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-SOLUSDT/", "patlama_adayi": false, "adx": 19.73, "macd_bullish": true, "macd_val": 2.3974, "macd_sig": 1.0628, "macd_hist": 1.3346, "rvol": 0.91}, {"symbol": "DIS", "fiyat": 97.21, "birim": "$", "degisim": -0.21, "rsi": 41.13, "skor": -5, "alim_min": 96.09, "alim_max": 100.05, "alim_durum": "ŞİMDİ", "stop": 92.25, "kar_hedef_1": 100.92, "kar_hedef_2": 104.63, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 3.82, "beklenen_kar_yuzde_2": 7.64, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 106.0, "menzil_asagi": 88.41, "roc10": -4.39, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "US", "tv_link": "https://tr.tradingview.com/symbols/DIS/", "patlama_adayi": false, "adx": 15.39, "macd_bullish": false, "macd_val": -1.0243, "macd_sig": -0.8344, "macd_hist": -0.1899, "rvol": 0.49}, {"symbol": "AVAXTRY", "fiyat": 317.98, "birim": "₺", "degisim": -1.91, "rsi": 58.57, "skor": 75, "alim_min": 307.4, "alim_max": 320.07, "alim_durum": "ŞİMDİ", "stop": 285.95, "kar_hedef_1": 341.99, "kar_hedef_2": 366.01, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 7.55, "beklenen_kar_yuzde_2": 15.11, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 383.5, "menzil_asagi": 252.45, "roc10": 5.68, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-AVAXUSDT/", "patlama_adayi": false, "adx": 39.73, "macd_bullish": true, "macd_val": -0.083, "macd_sig": -0.1996, "macd_hist": 0.1166, "rvol": 0.87}, {"symbol": "XRPTRY", "fiyat": 52.82, "birim": "₺", "degisim": -1.39, "rsi": 53.69, "skor": 65, "alim_min": 50.88, "alim_max": 52.97, "alim_durum": "ŞİMDİ", "stop": 48.52, "kar_hedef_1": 56.04, "kar_hedef_2": 59.26, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 6.1, "beklenen_kar_yuzde_2": 12.2, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 65.91, "menzil_asagi": 39.73, "roc10": 7.79, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-XRPUSDT/", "patlama_adayi": false, "adx": 21.27, "macd_bullish": true, "macd_val": -0.0145, "macd_sig": -0.03, "macd_hist": 0.0154, "rvol": 0.9}, {"symbol": "BNBTRY", "fiyat": 27367.04, "birim": "₺", "degisim": -0.18, "rsi": 53.09, "skor": 60, "alim_min": 26253.46, "alim_max": 27336.08, "alim_durum": "YAKIN", "stop": 25653.8, "kar_hedef_1": 28651.98, "kar_hedef_2": 29936.91, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 4.7, "beklenen_kar_yuzde_2": 9.39, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 31699.38, "menzil_asagi": 23034.71, "roc10": 5.03, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-BNBUSDT/", "patlama_adayi": false, "adx": 31.49, "macd_bullish": true, "macd_val": -7.2072, "macd_sig": -12.5132, "macd_hist": 5.306, "rvol": 0.98}, {"symbol": "ADATRY", "fiyat": 8.29, "birim": "₺", "degisim": -3.77, "rsi": 65.43, "skor": 75, "alim_min": 7.69, "alim_max": 8.0, "alim_durum": "BEKLE", "stop": 7.26, "kar_hedef_1": 9.07, "kar_hedef_2": 9.84, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 9.35, "beklenen_kar_yuzde_2": 18.7, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 11.13, "menzil_asagi": 5.45, "roc10": 22.05, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-ADAUSDT/", "patlama_adayi": false, "adx": 45.93, "macd_bullish": true, "macd_val": -0.0005, "macd_sig": -0.0067, "macd_hist": 0.0062, "rvol": 0.84}, {"symbol": "LINKTRY", "fiyat": 373.52, "birim": "₺", "degisim": -0.5, "rsi": 59.72, "skor": 65, "alim_min": 354.45, "alim_max": 369.07, "alim_durum": "YAKIN", "stop": 342.41, "kar_hedef_1": 396.85, "kar_hedef_2": 420.17, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 6.25, "beklenen_kar_yuzde_2": 12.49, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 446.03, "menzil_asagi": 301.0, "roc10": 9.43, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-LINKUSDT/", "patlama_adayi": false, "adx": 20.91, "macd_bullish": true, "macd_val": -0.0653, "macd_sig": -0.1804, "macd_hist": 0.1151, "rvol": 0.91}, {"symbol": "DOGETRY", "fiyat": 3.52, "birim": "₺", "degisim": -1.96, "rsi": 39.18, "skor": 63, "alim_min": 3.56, "alim_max": 3.7, "alim_durum": "ŞİMDİ", "stop": 3.19, "kar_hedef_1": 3.76, "kar_hedef_2": 4.01, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 6.99, "beklenen_kar_yuzde_2": 13.97, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 4.55, "menzil_asagi": 2.48, "roc10": 0.87, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-DOGEUSDT/", "patlama_adayi": false, "adx": 52.28, "macd_bullish": true, "macd_val": -0.0032, "macd_sig": -0.004, "macd_hist": 0.0008, "rvol": 1.1}, {"symbol": "LTCTRY", "fiyat": 2076.91, "birim": "₺", "degisim": -1.06, "rsi": 61.18, "skor": 65, "alim_min": 2000.89, "alim_max": 2083.4, "alim_durum": "ŞİMDİ", "stop": 1905.84, "kar_hedef_1": 2205.22, "kar_hedef_2": 2333.53, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 6.18, "beklenen_kar_yuzde_2": 12.36, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 2400.96, "menzil_asagi": 1752.87, "roc10": 5.26, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-LTCUSDT/", "patlama_adayi": false, "adx": 20.97, "macd_bullish": true, "macd_val": -0.337, "macd_sig": -0.8649, "macd_hist": 0.5279, "rvol": 0.92}, {"symbol": "TRXTRY", "fiyat": 15.55, "birim": "₺", "degisim": 0.82, "rsi": 54.77, "skor": 85, "alim_min": 14.76, "alim_max": 15.37, "alim_durum": "YAKIN", "stop": 15.12, "kar_hedef_1": 15.88, "kar_hedef_2": 16.21, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 2.1, "beklenen_kar_yuzde_2": 4.19, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 16.59, "menzil_asagi": 14.52, "roc10": 3.55, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-TRXUSDT/", "patlama_adayi": false, "adx": 13.27, "macd_bullish": true, "macd_val": -0.0006, "macd_sig": -0.0024, "macd_hist": 0.0019, "rvol": 0.87}, {"symbol": "NEARTRY", "fiyat": 96.56, "birim": "₺", "degisim": 0.57, "rsi": 55.42, "skor": 95, "alim_min": 90.77, "alim_max": 94.51, "alim_durum": "YAKIN", "stop": 84.58, "kar_hedef_1": 105.55, "kar_hedef_2": 114.53, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 9.3, "beklenen_kar_yuzde_2": 18.61, "trend_yukselis": true, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Yukarı", "ucgen_tip": "notr", "menzil_yukari": 134.31, "menzil_asagi": 58.81, "roc10": 10.35, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-NEARUSDT/", "patlama_adayi": false, "adx": 19.05, "macd_bullish": true, "macd_val": -0.0217, "macd_sig": -0.0432, "macd_hist": 0.0215, "rvol": 0.86}, {"symbol": "ICPTRY", "fiyat": 104.29, "birim": "₺", "degisim": 0.24, "rsi": 51.52, "skor": 63, "alim_min": 101.87, "alim_max": 106.07, "alim_durum": "ŞİMDİ", "stop": 93.49, "kar_hedef_1": 112.39, "kar_hedef_2": 120.49, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 7.76, "beklenen_kar_yuzde_2": 15.53, "trend_yukselis": false, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "yukselen", "menzil_yukari": 130.72, "menzil_asagi": 77.86, "roc10": 3.93, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-ICPUSDT/", "patlama_adayi": false, "adx": 23.81, "macd_bullish": true, "macd_val": -0.0545, "macd_sig": -0.0755, "macd_hist": 0.021, "rvol": 1.09}, {"symbol": "DOTTRY", "fiyat": 40.79, "birim": "₺", "degisim": -1.53, "rsi": 41.36, "skor": 40, "alim_min": 40.62, "alim_max": 42.29, "alim_durum": "ŞİMDİ", "stop": 36.88, "kar_hedef_1": 43.72, "kar_hedef_2": 46.66, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 7.19, "beklenen_kar_yuzde_2": 14.39, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Aşağı", "ucgen_tip": "notr", "menzil_yukari": 52.28, "menzil_asagi": 29.3, "roc10": 6.88, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-DOTUSDT/", "patlama_adayi": false, "adx": 43.08, "macd_bullish": true, "macd_val": -0.0398, "macd_sig": -0.0526, "macd_hist": 0.0128, "rvol": 1.15}, {"symbol": "ARBTRY", "fiyat": 0.04, "birim": "₺", "degisim": 0.01, "rsi": 100.0, "skor": 57, "alim_min": 0.03, "alim_max": 0.04, "alim_durum": "ŞİMDİ", "stop": 0.04, "kar_hedef_1": 0.04, "kar_hedef_2": 0.04, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 0.0, "beklenen_kar_yuzde_2": 0.0, "trend_yukselis": false, "sikisma": false, "hacim_kurumus": true, "birikim": true, "birikim_raw": true, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 0.04, "menzil_asagi": 0.04, "roc10": 0.01, "garanti": false, "acik_mi": true, "hacim_yuksek": true, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-ARBUSDT/", "patlama_adayi": false, "adx": 7.14, "macd_bullish": false, "macd_val": -0.0, "macd_sig": -0.0, "macd_hist": 0.0, "rvol": 20.0}, {"symbol": "OPTRY", "fiyat": 4.87, "birim": "₺", "degisim": -2.97, "rsi": 54.07, "skor": 58, "alim_min": 4.73, "alim_max": 4.92, "alim_durum": "ŞİMDİ", "stop": 4.29, "kar_hedef_1": 5.3, "kar_hedef_2": 5.74, "ro_1": 0.75, "ro_2": 1.5, "beklenen_kar_yuzde_1": 8.88, "beklenen_kar_yuzde_2": 17.76, "trend_yukselis": false, "sikisma": true, "hacim_kurumus": false, "birikim": false, "birikim_raw": false, "dagitim": false, "yon_bias": "Nötr", "ucgen_tip": "notr", "menzil_yukari": 5.97, "menzil_asagi": 3.77, "roc10": 3.36, "garanti": false, "acik_mi": true, "hacim_yuksek": false, "piyasa_id": "KR", "tv_link": "https://tr.tradingview.com/symbols/BINANCE-OPUSDT/", "patlama_adayi": false, "adx": 23.32, "macd_bullish": true, "macd_val": -0.001, "macd_sig": -0.0022, "macd_hist": 0.0012, "rvol": 0.72}];
+        const dataset = {json_data};
 
         let currentTab = 'ALL';
         let searchQuery = '';
@@ -556,90 +1256,91 @@
         let sortDirection = 'desc';
 
         // Başlangıç istatistikleri ve render
-        function initDashboard() {
+        function initDashboard() {{
             updateCards();
             renderTable();
-        }
+        }}
 
-        function updateCards() {
+        function updateCards() {{
             document.getElementById('card-total').innerText = dataset.length;
             document.getElementById('card-guaranteed').innerText = dataset.filter(x => x.garanti).length;
             document.getElementById('card-breakouts').innerText = dataset.filter(x => x.patlama_adayi).length;
             document.getElementById('card-squeeze').innerText = dataset.filter(x => x.sikisma).length;
             document.getElementById('card-accumulation').innerText = dataset.filter(x => x.birikim_raw).length;
-        }
+            document.getElementById('card-tf-approval').innerText = dataset.filter(x => x.tf4h_onay && x.tf1h_onay).length;
+        }}
 
-        function setTab(tab) {
+        function setTab(tab) {{
             currentTab = tab;
             // Tab active class güncelle
             const buttons = document.querySelectorAll('.tab-btn');
-            buttons.forEach(btn => {
+            buttons.forEach(btn => {{
                 if (btn.innerText === 'Tümü' && tab === 'ALL') btn.classList.add('active');
                 else if (btn.innerText === 'BIST' && tab === 'TR') btn.classList.add('active');
                 else if (btn.innerText === 'ABD Borsası' && tab === 'US') btn.classList.add('active');
                 else if (btn.innerText === 'Kripto' && tab === 'KR') btn.classList.add('active');
                 else btn.classList.remove('active');
-            });
+            }});
             renderTable();
-        }
+        }}
 
-        function toggleFilter(filter) {
-            if (filter === 'guaranteed') {
+        function toggleFilter(filter) {{
+            if (filter === 'guaranteed') {{
                 filterGuaranteed = !filterGuaranteed;
                 document.getElementById('chip-guaranteed').classList.toggle('active', filterGuaranteed);
-            } else if (filter === 'squeeze') {
+            }} else if (filter === 'squeeze') {{
                 filterSqueeze = !filterSqueeze;
                 document.getElementById('chip-squeeze').classList.toggle('active', filterSqueeze);
-            } else if (filter === 'accumulation') {
+            }} else if (filter === 'accumulation') {{
                 filterAccumulation = !filterAccumulation;
                 document.getElementById('chip-accumulation').classList.toggle('active', filterAccumulation);
-            } else if (filter === 'now') {
+            }} else if (filter === 'now') {{
                 filterNow = !filterNow;
                 document.getElementById('chip-now').classList.toggle('active', filterNow);
-            } else if (filter === 'breakout') {
+            }} else if (filter === 'breakout') {{
                 filterBreakout = !filterBreakout;
                 document.getElementById('chip-breakout').classList.toggle('active', filterBreakout);
-            }
+            }}
             renderTable();
-        }
+        }}
 
-        function handleSearch(val) {
+        function handleSearch(val) {{
             searchQuery = val.toLowerCase().trim();
             renderTable();
-        }
+        }}
 
-        function handleSort(column) {
-            if (sortColumn === column) {
+        function handleSort(column) {{
+            if (sortColumn === column) {{
                 sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
-            } else {
+            }} else {{
                 sortColumn = column;
                 sortDirection = 'desc';
-            }
+            }}
             
             // Header işaretçilerini güncelle
             const headers = document.querySelectorAll('th');
-            headers.forEach(th => {
+            headers.forEach(th => {{
                 th.classList.remove('sort-asc', 'sort-desc');
-                if (th.getAttribute('onclick') && th.getAttribute('onclick').includes(column)) {
+                if (th.getAttribute('onclick') && th.getAttribute('onclick').includes(column)) {{
                     th.classList.add(sortDirection === 'asc' ? 'sort-asc' : 'sort-desc');
-                }
-            });
+                }}
+            }});
             
             renderTable();
-        }
+        }}
 
-        function formatCurrency(val, birim) {
+        function formatCurrency(val, birim) {{
             if (val >= 1000000) return (val/1000000).toFixed(1) + 'M' + birim;
             if (val >= 1000) return val.toFixed(0) + birim;
             return val.toFixed(1) + birim;
-        }
+        }}
 
-        function renderTable() {
+        function renderTable() {{
             const tbody = document.getElementById('table-body');
             const noDataMsg = document.getElementById('no-data-msg');
             
             // Filtreleme
-            let filtered = dataset.filter(item => {
+            let filtered = dataset.filter(item => {{
                 // Tab filtresi
                 if (currentTab !== 'ALL' && item.piyasa_id !== currentTab) return false;
                 
@@ -654,10 +1355,10 @@
                 if (filterNow && item.alim_durum !== 'ŞİMDİ') return false;
                 
                 return true;
-            });
+            }});
 
             // Sıralama
-            filtered.sort((a, b) => {
+            filtered.sort((a, b) => {{
                 let valA = a[sortColumn];
                 let valB = b[sortColumn];
 
@@ -666,31 +1367,31 @@
                 if (valB === null || valB === undefined) valB = sortDirection === 'asc' ? Infinity : -Infinity;
 
                 // String karşılaştırması
-                if (typeof valA === 'string') {
+                if (typeof valA === 'string') {{
                     return sortDirection === 'asc' 
                         ? valA.localeCompare(valB) 
                         : valB.localeCompare(valA);
-                }
+                }}
 
                 // Boolean karşılaştırması
-                if (typeof valA === 'boolean') {
+                if (typeof valA === 'boolean') {{
                     valA = valA ? 1 : 0;
                     valB = valB ? 1 : 0;
-                }
+                }}
 
                 return sortDirection === 'asc' ? valA - valB : valB - valA;
-            });
+            }});
 
-            if (filtered.length === 0) {
+            if (filtered.length === 0) {{
                 tbody.innerHTML = '';
                 noDataMsg.style.display = 'block';
                 return;
-            }
+            }}
             
             noDataMsg.style.display = 'none';
             
             let html = '';
-            filtered.forEach(item => {
+            filtered.forEach(item => {{
                 const pDot = item.acik_mi 
                     ? '<span class="market-dot market-open" title="Açık"></span>' 
                     : '<span class="market-dot market-closed" title="Kapalı"></span>';
@@ -715,12 +1416,12 @@
                 if (item.adx >= 25) adxRenk = 'text-green';
                 else if (item.adx < 18) adxRenk = 'text-muted';
                 else adxRenk = 'text-main';
-                const adxStr = `<span class="${adxRenk}" style="font-weight:600;">${item.adx.toFixed(0)}</span>`;
+                const adxStr = `<span class="${{adxRenk}}" style="font-weight:600;">${{item.adx.toFixed(0)}}</span>`;
 
                 let yonRenk = '';
                 let yonIcon = '–';
-                if (item.yon_bias === 'Yukarı') { yonRenk = 'text-green'; yonIcon = '▲'; }
-                else if (item.yon_bias === 'Aşağı') { yonRenk = 'text-red'; yonIcon = '▼'; }
+                if (item.yon_bias === 'Yukarı') {{ yonRenk = 'text-green'; yonIcon = '▲'; }}
+                else if (item.yon_bias === 'Aşağı') {{ yonRenk = 'text-red'; yonIcon = '▼'; }}
 
                 let alimRenk = 'text-muted';
                 if (item.alim_durum === 'ŞİMDİ') alimRenk = 'text-green';
@@ -736,13 +1437,13 @@
                 else if (item.beklenen_kar_yuzde_2 >= 4) karRenk = 'text-yellow';
 
                 let durumBadge = '';
-                if (item.garanti) {
+                if (item.garanti) {{
                     durumBadge = '<span class="badge badge-garanti">🛡️ Garanti</span>';
-                } else {
+                }} else {{
                     if (item.skor >= 90) durumBadge = '<span class="badge badge-izl">İzle</span>';
                     else if (item.skor >= 70) durumBadge = '<span class="badge badge-near">Potansiyel</span>';
                     else durumBadge = '<span class="badge badge-wait">Bekle</span>';
-                }
+                }}
 
                 let icons = '';
                 if (item.hacim_yuksek) icons += '<span class="icon-badge" title="Yüksek Hacim">🔥</span>';
@@ -754,45 +1455,364 @@
 
                 html += `
                     <tr>
-                        <td style="text-align:center;">${pDot}</td>
+                        <td style="text-align:center;">${{pDot}}</td>
                         <td>
                             <div class="symbol-cell">
-                                <span>${item.symbol}</span>
-                                <div class="icon-badges">${icons}</div>
+                                <span>${{item.symbol}}</span>
+                                <div class="icon-badges">${{icons}}</div>
                             </div>
                         </td>
-                        <td><strong style="color:#fff;">${formatCurrency(item.fiyat, item.birim)}</strong></td>
-                        <td class="${degisimRenk}">${degisimSign}${item.degisim.toFixed(1)}%</td>
-                        <td class="${rsiRenk}" style="font-weight:600; text-align:center;">${item.rsi.toFixed(0)}</td>
-                        <td style="text-align:center;">${trendStr}</td>
-                        <td style="text-align:center;">${macdStr}</td>
-                        <td style="text-align:center;">${adxStr}</td>
-                        <td class="${yonRenk}" style="text-align:center; font-weight:bold;">${yonIcon}</td>
-                        <td class="${alimRenk}" style="font-weight:600;">${alimAraligiStr}</td>
-                        <td class="text-red">${formatCurrency(item.stop, item.birim)}</td>
-                        <td class="text-green">${formatCurrency(item.kar_hedef_1, item.birim)}</td>
-                        <td class="text-green" style="font-weight:600;">${formatCurrency(item.kar_hedef_2, item.birim)}</td>
-                        <td class="${roRenk}" style="text-align:center; font-weight:600;">${item.ro_1} / ${item.ro_2}</td>
-                        <td class="${karRenk}">+${item.beklenen_kar_yuzde_1.toFixed(0)}% / +${item.beklenen_kar_yuzde_2.toFixed(0)}%</td>
+                        <td><strong style="color:#fff;">${{formatCurrency(item.fiyat, item.birim)}}</strong></td>
+                        <td class="${{degisimRenk}}">${{degisimSign}}${{item.degisim.toFixed(1)}}%</td>
+                        <td class="${{rsiRenk}}" style="font-weight:600; text-align:center;">${{item.rsi.toFixed(0)}}</td>
+                        <td style="text-align:center;">${{trendStr}}</td>
+                        <td style="text-align:center;">${{macdStr}}</td>
+                        <td style="text-align:center;">${{adxStr}}</td>
+                        <td class="${{yonRenk}}" style="text-align:center; font-weight:bold;">${{yonIcon}}</td>
+                        <td class="${{alimRenk}}" style="font-weight:600;">${{alimAraligiStr}}</td>
+                        <td class="text-red">${{formatCurrency(item.stop, item.birim)}}</td>
+                        <td class="text-green">${{formatCurrency(item.kar_hedef_1, item.birim)}}</td>
+                        <td class="text-green" style="font-weight:600;">${{formatCurrency(item.kar_hedef_2, item.birim)}}</td>
+                        <td class="${{roRenk}}" style="text-align:center; font-weight:600;">${{item.ro_1}} / ${{item.ro_2}}</td>
+                        <td class="${{karRenk}}">+${{item.beklenen_kar_yuzde_1.toFixed(0)}}% / +${{item.beklenen_kar_yuzde_2.toFixed(0)}}%</td>
                         <td class="text-muted" style="font-size:0.8rem;">
-                            ${formatCurrency(item.menzil_asagi, item.birim)}-${formatCurrency(item.menzil_yukari, item.birim)}
+                            ${{formatCurrency(item.menzil_asagi, item.birim)}}-${{formatCurrency(item.menzil_yukari, item.birim)}}
                         </td>
-                        <td style="text-align:center;"><strong>${item.skor}</strong></td>
-                        <td>${durumBadge}</td>
+                        <td style="text-align:center;">${{item.tf4h_onay ? '✅' : '❌'}}</td>
+                        <td style="text-align:center;">${{item.tf1h_onay ? '✅' : '❌'}}</td>
+                        <td style="text-align:center;"><strong>${{item.skor}}</strong></td>
+                        <td>${{durumBadge}}</td>
                         <td>
-                            <a href="${item.tv_link}" target="_blank" class="btn-tv">
+                            <a href="${{item.tv_link}}" target="_blank" class="btn-tv">
                                 Grafik ↗
                             </a>
                         </td>
                     </tr>
                 `;
-            });
+            }});
             
             tbody.innerHTML = html;
-        }
+        }}
 
         // Sayfa yüklendiğinde başlat
         window.onload = initDashboard;
     </script>
 </body>
 </html>
+"""
+        with open(yol, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        if VERBOSE:
+            print(f"Web Gösterge Paneli güncellendi: {yol}")
+    except Exception as e:
+        print(f"HTML Dashboard oluşturma hatası: {e}")
+
+# --- ANA TARAMA DÖNGÜSÜ ---
+def piyasa_tara():
+    try:
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+        usd_try = guncel_dolar_kuru_al()
+        eur_try = guncel_euro_kuru_al()
+        bugun_str = datetime.now(ISTANBUL_TZ).strftime("%Y%m%d")
+
+        # Eşzamanlı tarama için tüm sembolleri listeye ekle
+        tarama_listesi = []
+        for piyasa in PIYASALAR:
+            acik_mi = piyasa_acik_mi(piyasa["id"])
+            for ticker in piyasa["semboller"]:
+                tarama_listesi.append((ticker, piyasa, acik_mi))
+
+        piyasa_sonuclari = {p["id"]: [] for p in PIYASALAR}
+        tum_sinyaller_listesi = []
+        toplam_taranan = len(tarama_listesi)
+
+        print(Fore.CYAN + f"[*] {toplam_taranan} sembol paralel olarak taranıyor (max 10 iş parçacığı)..." + Style.RESET_ALL)
+
+        # ThreadPool ile eşzamanlı veri çekme
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_ticker = {
+                executor.submit(sembol_tara, item[0], item[1], usd_try, item[2]): item[0] 
+                for item in tarama_listesi
+            }
+            
+            for future in as_completed(future_to_ticker):
+                ticker = future_to_ticker[future]
+                try:
+                    res = future.result()
+                    if res is not None:
+                        piyasa_sonuclari[res["piyasa_id"]].append(res)
+                        tum_sinyaller_listesi.append(res)
+                except Exception as e:
+                    if VERBOSE:
+                        print(f"İşlem hatası ({ticker}): {e}")
+
+        # Toplam kritere uyan (stop limitinin üstünde kalıp analiz listesine girenler)
+        toplam_kritere_uyan = sum(len(piyasa_sonuclari[p["id"]]) for p in PIYASALAR)
+
+        # Her piyasadan en iyi 5 sembolü seçip konsolda göstereceğiz
+        gosterilecek_konsol = []
+        for piyasa in PIYASALAR:
+            liste = piyasa_sonuclari[piyasa["id"]]
+            # Sıralama: Garanti durumuna, skora ve beklenen kâr yüzdesine göre
+            liste.sort(key=lambda x: (x["garanti"], x["skor"], x["beklenen_kar_yuzde_2"]), reverse=True)
+            secilen = liste[:5]
+            gosterilecek_konsol.extend(secilen)
+
+        # Konsol listesini de kendi içinde sırala
+        gosterilecek_konsol.sort(key=lambda x: (x["garanti"], x["skor"], x["beklenen_kar_yuzde_2"]), reverse=True)
+
+        # === PRETTYTABLE OLUŞTUR ===
+        tablo = PrettyTable()
+        tablo.field_names = [
+            "P", "Sembol", "Fyt", "%", "RSI", "T", "M", "A",
+            "Alım", "Stop", "Hedef", "R/O", "Kâr%", "S", "Drm"
+        ]
+
+        # Hizalamalar
+        for col in ["P", "RSI", "T", "M", "A", "R/O", "S", "Drm"]:
+            tablo.align[col] = "c"
+        tablo.align["Sembol"] = "l"
+        for col in ["Fyt", "%", "Alım", "Stop", "Hedef", "Kâr%"]:
+            tablo.align[col] = "r"
+
+        garanti_sayisi = 0
+        for item in gosterilecek_konsol:
+            try:
+                if item["degisim"] > 0:
+                    degisim_str = f"+{item['degisim']:.1f}%"
+                    degisim_renk = Fore.GREEN
+                elif item["degisim"] < 0:
+                    degisim_str = f"{item['degisim']:.1f}%"
+                    degisim_renk = Fore.RED
+                else:
+                    degisim_str = f"{item['degisim']:.1f}%"
+                    degisim_renk = Fore.WHITE
+
+                if item["rsi"] >= 70:
+                    rsi_r = Fore.RED + Style.BRIGHT
+                elif item["rsi"] >= 60:
+                    rsi_r = Fore.YELLOW + Style.BRIGHT
+                elif item["rsi"] >= 50:
+                    rsi_r = Fore.GREEN + Style.BRIGHT
+                elif item["rsi"] >= 30:
+                    rsi_r = Fore.CYAN
+                else:
+                    rsi_r = Fore.BLUE + Style.BRIGHT
+
+                if item["garanti"]:
+                    skor_str = Fore.GREEN + Style.BRIGHT + str(item["skor"]) + Style.RESET_ALL
+                    ro_str = f"{item['ro_2']}"
+                    ro_str = (Fore.GREEN + Style.BRIGHT if item["ro_2"] >= 2.0 else Fore.GREEN) + ro_str + Style.RESET_ALL
+                    
+                    if item["acik_mi"]:
+                        durum_str = Back.GREEN + Fore.BLACK + Style.BRIGHT + " AL " + Style.RESET_ALL
+                    else:
+                        durum_str = Back.YELLOW + Fore.BLACK + Style.BRIGHT + "AL*" + Style.RESET_ALL
+                    garanti_sayisi += 1
+                else:
+                    if item["skor"] >= 90:
+                        skor_str = Fore.YELLOW + Style.BRIGHT + str(item["skor"]) + Style.RESET_ALL
+                    elif item["skor"] >= 70:
+                        skor_str = Fore.YELLOW + str(item["skor"]) + Style.RESET_ALL
+                    else:
+                        skor_str = Fore.WHITE + str(item["skor"]) + Style.RESET_ALL
+
+                    ro_str = f"{item['ro_2']}"
+                    if item["ro_2"] >= 2.0:
+                        ro_str = Fore.CYAN + ro_str + Style.RESET_ALL
+                    elif item["ro_2"] >= 1.5:
+                        ro_str = Fore.WHITE + ro_str + Style.RESET_ALL
+                    else:
+                        ro_str = Fore.RED + ro_str + Style.RESET_ALL
+
+                    if item["skor"] >= 90:
+                        durum_str = Fore.CYAN + "İzl" + Style.RESET_ALL
+                    elif item["skor"] >= 70:
+                        durum_str = Fore.WHITE + "Pot" + Style.RESET_ALL
+                    else:
+                        durum_str = Fore.RED + "Bek" + Style.RESET_ALL
+
+                piyasa_gosterge = "●" if item["acik_mi"] else "○"
+                piyasa_renk = Fore.GREEN if item["acik_mi"] else Fore.RED
+
+                alim_renk = Fore.GREEN + Style.BRIGHT if item["alim_durum"] == "ŞİMDİ" else (Fore.YELLOW if item["alim_durum"] == "YAKIN" else Fore.RED)
+
+                hacim = " 🔥" if item["hacim_yuksek"] else ""
+                erken_ikon = ""
+                if item.get("sikisma"): erken_ikon += " 🌀"
+                if item.get("birikim_raw"): erken_ikon += " 📥"
+                if item.get("patlama_adayi"): erken_ikon += " 🚀"  # Patlama adayı roketi
+
+                if item["trend_yukselis"] is True:
+                    trend_str = Fore.GREEN + Style.BRIGHT + "↑" + Style.RESET_ALL
+                elif item["trend_yukselis"] is False:
+                    trend_str = Fore.RED + "↓" + Style.RESET_ALL
+                else:
+                    trend_str = Fore.LIGHTBLACK_EX + "?" + Style.RESET_ALL
+
+                # MACD
+                if item["macd_bullish"]:
+                    macd_str = Fore.GREEN + "AL" + Style.RESET_ALL
+                else:
+                    macd_str = Fore.RED + "SAT" + Style.RESET_ALL
+
+                # ADX
+                adx_v = item["adx"]
+                if adx_v >= 25:
+                    adx_str = Fore.GREEN + Style.BRIGHT + f"{adx_v:.0f}" + Style.RESET_ALL
+                elif adx_v < 18:
+                    adx_str = Fore.LIGHTBLACK_EX + f"{adx_v:.0f}" + Style.RESET_ALL
+                else:
+                    adx_str = Fore.WHITE + f"{adx_v:.0f}" + Style.RESET_ALL
+
+                bkl_kar = item["beklenen_kar_yuzde_2"]
+                bkl_kar_str = (Fore.GREEN + Style.BRIGHT if bkl_kar >= 8 else (Fore.YELLOW if bkl_kar >= 4 else Fore.WHITE)) + f"+{bkl_kar:.0f}%" + Style.RESET_ALL
+
+                tablo.add_row([
+                    f"{piyasa_renk}{piyasa_gosterge}{Style.RESET_ALL}",
+                    f"{Fore.CYAN}{Style.BRIGHT}{item['symbol']:<7}{Style.RESET_ALL}{hacim}{erken_ikon}",
+                    f"{Fore.WHITE}{deger_formatla(item['fiyat'])}{item['birim']}{Style.RESET_ALL}",
+                    f"{degisim_renk}{degisim_str}{Style.RESET_ALL}",
+                    f"{rsi_r}{item['rsi']:.0f}{Style.RESET_ALL}",
+                    trend_str,
+                    macd_str,
+                    adx_str,
+                    f"{alim_renk}{deger_formatla(item['alim_max'])}{Style.RESET_ALL}",
+                    f"{Fore.RED}{deger_formatla(item['stop'])}{Style.RESET_ALL}",
+                    f"{Fore.GREEN}{deger_formatla(item['kar_hedef_2'])}{Style.RESET_ALL}",
+                    ro_str,
+                    bkl_kar_str,
+                    skor_str,
+                    durum_str
+                ])
+
+                # --- Telegram Bildirim Mekanizması ---
+                if item["garanti"]:
+                    sinyal_key = f"{item['piyasa_id']}_{item['symbol']}_{bugun_str}"
+                    if sinyal_key not in gonderilen_sinyaller:
+                        try:
+                            erken_liste = []
+                            if item.get("sikisma"): erken_liste.append("Sıkışma(🌀)")
+                            if item.get("hacim_kurumus"): erken_liste.append("Hacim kuruması")
+                            if item.get("birikim_raw"): erken_liste.append("OBV birikim(📥)")
+                            if item.get("patlama_adayi"): erken_liste.append("Patlama Potansiyeli(🚀)")
+                            erken_metin = ", ".join(erken_liste) if erken_liste else "Yok"
+
+                            piyasa_durum_metni = "⚠️ <b>(Piyasa Kapalı - Hafta Sonu Sinyali)</b>\n" if not item["acik_mi"] else ""
+
+                            mesaj = (
+                                f"🛡️ <b>{item['symbol']} - GARANTİ AL SİNYALİ</b>\n"
+                                f"{piyasa_durum_metni}"
+                                f"🌍 <b>Piyasa:</b> {item['piyasa_id']}\n"
+                                f"💰 {deger_formatla(item['fiyat'])}{item['birim']} | RSI:{item['rsi']:.0f} | Skor:{item['skor']}\n"
+                                f"📈 Trend: {'Yükseliş' if item['trend_yukselis'] else 'Belirsiz'} | Yön: {item['yon_bias']}\n"
+                                f"🔎 Erken Sinyaller: {erken_metin}\n"
+                                f"📌 Alım Aralığı: {deger_formatla(item['alim_min'])} - {deger_formatla(item['alim_max'])} ({item['alim_durum']})\n"
+                                f"🛑 Stop: {deger_formatla(item['stop'])} | 🎯 Hedef-1: {deger_formatla(item['kar_hedef_1'])} | 🚀 Hedef-2: {deger_formatla(item['kar_hedef_2'])}\n"
+                                f"⚖️ Risk/Ödül: {item['ro_1']} / {item['ro_2']} | 🎯 Beklenen Kâr: +{item['beklenen_kar_yuzde_1']:.0f}% / +{item['beklenen_kar_yuzde_2']:.0f}%\n"
+                                f"↕️ Olası Menzil: {deger_formatla(item['menzil_asagi'])} - {deger_formatla(item['menzil_yukari'])}\n"
+                                f"⚠️ Yatırım tavsiyesi değildir."
+                            )
+                            bildirim_gonder(mesaj)
+                            gonderilen_sinyaller.add(sinyal_key)
+                        except Exception as e:
+                            if VERBOSE:
+                                print(f"Telegram gönderim hatası: {e}")
+
+            except Exception as e:
+                if VERBOSE:
+                    print(f"Satır hatası: {e}")
+
+        # Sinyalleri diske kaydet
+        sinyalleri_kaydet(gonderilen_sinyaller)
+
+        # HTML Raporunu Üret (Tüm sonuçları gönderiyoruz, böylece panoda filtreleme yapılabilir)
+        html_dashboard_olustur(gosterilecek_konsol, tum_sinyaller_listesi, usd_try, eur_try)
+
+        # === EKRAN ÇIKTISI ===
+        print(Fore.LIGHTBLUE_EX + Style.BRIGHT +
+              f"💵 USD/TRY: {usd_try:.2f}   Euro/TRY: {eur_try:.2f}   ⏰ {datetime.now(ISTANBUL_TZ).strftime('%H:%M:%S')}"
+              + Style.RESET_ALL)
+        print()
+
+        print(tablo)
+
+        print(f"\n{Back.GREEN + Fore.BLACK + Style.BRIGHT} 🛡️ Garanti: {garanti_sayisi} {Style.RESET_ALL} | "
+              f"{Fore.CYAN}📊 Tüm: {len(gosterilecek_konsol)-garanti_sayisi}{Style.RESET_ALL} | "
+              f"{Fore.WHITE}Top: {len(gosterilecek_konsol)}{Style.RESET_ALL}")
+        
+        piyasa_ozet = " + ".join(f"{p['id']}:{len(p['semboller'])}" for p in PIYASALAR)
+        print(f"{Fore.LIGHTBLACK_EX}Toplam taranan: {toplam_taranan} sembol ({piyasa_ozet}) | "
+              f"Kritere uyan (stop üstü): {toplam_kritere_uyan}{Style.RESET_ALL}")
+        
+        print(Fore.GREEN + f"[+] Web Gösterge Paneli başarıyla güncellendi: {DASHBOARD_DOSYASI}" + Style.RESET_ALL)
+
+    except Exception as e:
+        hata_mesaji = traceback.format_exc()
+        hata_kaydet(hata_mesaji)
+        print(Fore.RED + f"\n❌ KRİTİK HATA: {e}" + Style.RESET_ALL)
+        print(Fore.YELLOW + f"Hata detayları 'hata_log.txt' dosyasına kaydedildi." + Style.RESET_ALL)
+        raise
+
+# === ANA PROGRAM BAŞLANGICI ===
+print("=" * 50)
+print("BORSA TARAMA ROBOTU BAŞLIYOR (Concurrency + Dashboard)")
+print("SÜRÜM: v7.5 (paralel tarama & interaktif web paneli)")
+print("=" * 50)
+
+try:
+    print("İlk tarama yapılıyor...")
+    piyasa_tara()
+
+    # GitHub Actions ortamında TEK tarama yap ve çık
+    if os.getenv("GITHUB_ACTIONS"):
+        print(Fore.GREEN + "\n[+] GitHub Actions ortamı algılandı. Tarama tamamlandı." + Style.RESET_ALL)
+
+    else:
+        while True:
+            try:
+                print(
+                    Fore.LIGHTBLUE_EX
+                    + f"\n[{datetime.now(ISTANBUL_TZ).strftime('%H:%M:%S')}] Sonraki tarama: {TARAMA_ARALIGI} dakika sonra..."
+                    + Style.RESET_ALL
+                )
+
+                print(
+                    Fore.YELLOW
+                    + "Kapatmak için Ctrl+C basın"
+                    + Style.RESET_ALL
+                )
+
+                time.sleep(TARAMA_ARALIGI * 60)
+
+                PIYASALAR, VERBOSE, TARAMA_ARALIGI = config_yukle()
+
+                piyasa_tara()
+
+            except KeyboardInterrupt:
+                print("\nKullanıcı tarafından durduruldu.")
+                break
+
+            except Exception as e:
+                hata_kaydet(traceback.format_exc())
+                print(Fore.RED + f"\n[!] Döngü hatası: {e}" + Style.RESET_ALL)
+                print(Fore.YELLOW + "15 saniye sonra tekrar deneniyor..." + Style.RESET_ALL)
+                time.sleep(15)
+
+except KeyboardInterrupt:
+    print("\nProgram kapatıldı.")
+
+except Exception as e:
+    hata_kaydet(traceback.format_exc())
+    print(Fore.RED + f"\n❌ Program durdu: {e}" + Style.RESET_ALL)
+    print(Fore.YELLOW + f"Hata:\n{traceback.format_exc()}" + Style.RESET_ALL)
+
+finally:
+    print("\n" + "=" * 50)
+
+    if not os.getenv("GITHUB_ACTIONS"):
+        print("Kapatmak için Enter tuşuna basın...")
+        input()
+    else:
+        print("GitHub Actions çalışması başarıyla tamamlandı.")
