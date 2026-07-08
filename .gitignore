@@ -1,0 +1,4 @@
+.env
+__pycache__/
+*.pyc
+hata_log.txt

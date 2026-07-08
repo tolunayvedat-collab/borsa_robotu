@@ -1,0 +1,51 @@
+{
+  "verbose": false,
+  "scan_interval_minutes": 15,
+  "markets": [
+    {
+      "id": "TR",
+      "ad": "TR",
+      "telegram_ad": "BIST",
+      "semboller": [
+        "THYAO.IS", "EREGL.IS", "AKBNK.IS", "ASELS.IS", "TUPRS.IS",
+        "SAHOL.IS", "BIMAS.IS", "YKBNK.IS", "KCHOL.IS", "ISCTR.IS",
+        "GARAN.IS", "SISE.IS", "PETKM.IS", "SASA.IS", "HEKTS.IS",
+        "ASTOR.IS", "KONTR.IS", "SMRTG.IS", "ALARK.IS", "ODAS.IS",
+        "GUBRF.IS", "PGSUS.IS", "FROTO.IS", "TOASO.IS", "ARCLK.IS",
+        "VESTL.IS", "VAKBN.IS", "HALKB.IS", "DOHOL.IS", "EKGYO.IS",
+        "ENKAI.IS", "TCELL.IS", "TTKOM.IS", "SOKM.IS", "MGROS.IS",
+        "AEFES.IS", "CCOLA.IS", "ENJSA.IS", "KRDMD.IS", "OTKAR.IS",
+        "TTRAK.IS", "OYAKC.IS", "BRYAT.IS", "BRSAN.IS", "DOAS.IS",
+        "ISMEN.IS", "MAVI.IS", "REEDR.IS", "YEOTK.IS", "MIATK.IS",
+        "SDTTR.IS", "ALFAS.IS", "EUPWR.IS", "CWENE.IS", "GESAN.IS",
+        "CANTE.IS", "EGEEN.IS", "BFREN.IS", "TAVHL.IS", "BOBET.IS",
+        "TKFEN.IS"
+      ]
+    },
+    {
+      "id": "US",
+      "ad": "US",
+      "telegram_ad": "ABD",
+      "semboller": [
+        "AAPL", "NVDA", "TSLA", "MSFT", "AMZN", "AMD", "META",
+        "GOOGL", "NFLX", "COIN", "INTC", "QCOM", "BABA", "XOM",
+        "AVGO", "ADBE", "CRM", "TXN", "MU", "INTU", "AMAT",
+        "ISRG", "LRCX", "BKNG", "MDLZ", "REGN", "VRTX", "ADP",
+        "PANW", "SNPS", "CDNS", "ASML", "MELI", "PYPL", "ABNB",
+        "TSM", "LLY", "JPM", "V", "MA", "UNH", "HD",
+        "PG", "BAC", "WMT", "KO", "PEP", "DIS"
+      ]
+    },
+    {
+      "id": "KR",
+      "ad": "KR",
+      "telegram_ad": "KR",
+      "semboller": [
+        "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "XRP-USD",
+        "LINK-USD", "BNB-USD", "ADA-USD", "DOT-USD", "LTC-USD",
+        "DOGE-USD", "NEAR-USD", "TRX-USD", "OP-USD", "ICP-USD",
+        "ARB-USD"
+      ]
+    }
+  ]
+}
